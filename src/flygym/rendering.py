@@ -114,7 +114,9 @@ class Renderer:
             frames = self.frames[cam_name]
             if len(frames) == 0:
                 raise RuntimeError(f"No frame recorded yet for camera {cam_name}.")
-            mediapy.show_video(frames, fps=self.output_fps, title=title or cam_name, **kwargs)
+            mediapy.show_video(
+                frames, fps=self.output_fps, title=title or cam_name, **kwargs
+            )
 
     def save_video(
         self,

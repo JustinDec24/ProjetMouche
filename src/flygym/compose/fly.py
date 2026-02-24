@@ -104,6 +104,7 @@ class Fly(BaseCompositionElement):
         self.bodyseg_to_mjcfmesh = {}
         self.bodyseg_to_mjcfbody = {}
         self.bodyseg_to_mjcfgeom = {}
+        self.bodyseg_to_mjcfactuator = {}
         self.jointdof_to_mjcfjoint = {}
         self.jointdof_to_mjcfactuator_by_type = {ty: {} for ty in ActuatorType}
         self.sensorname_to_mjcfsensor = {}
@@ -273,6 +274,10 @@ class Fly(BaseCompositionElement):
             neutral_input = neutral_input.get_angles_lookup(self.skeleton.axis_order)
 
         actuator_type = ActuatorType(actuator_type)
+        if actuator_type == ActuatorType.ADHESION:
+            raise ValueError(
+                "Adhesion actuators should be added via `add_adhesion_actuators()`, not `add_actuators()`."
+            )
         return_dict = {}
         for jointdof in jointdofs:
             self.jointdof_to_neutralaction_by_type[actuator_type][jointdof] = (
@@ -288,6 +293,42 @@ class Fly(BaseCompositionElement):
             )
             return_dict[jointdof] = actuator
         self.jointdof_to_mjcfactuator_by_type[actuator_type].update(return_dict)
+        self._rebuild_neutral_keyframe()
+        return return_dict
+
+    def add_adhesion_actuators(
+        self,
+        segments: Iterable[BodySegment],
+        gain: float,
+    ) -> dict[BodySegment, mjcf.Element]:
+        """Add adhesion actuators to specified body segments.
+        Creates actuators that can apply a normal force to the specified body segments
+        to simulate adhesion. The force is equal to the actuator input multiplied by the
+        gain. During simulation, the user should provide adhesion control input in the
+        order of the specified segments. See
+        `MuJoCo XML reference <https://mujoco.readthedocs.io/en/stable/XMLreference.html#actuator>`_
+        for details on supported attributes.
+
+        Args:
+            segments:
+                Body segments to apply adhesion to.
+            gain:
+                Multiplier for actuator input to compute adhesion force.
+        Returns:
+            Dictionary mapping body segment to created MJCF adhesion actuator element.
+        """
+        return_dict = {}
+        for segment in segments:
+            actuator = self.mjcf_root.actuator.add(
+                "adhesion",
+                name=f"{segment.name}_adhesion",
+                gain=f"{gain}",
+                body=segment.name,
+                ctrlrange="0 1000000",
+                forcerange="-inf inf",
+            )
+            return_dict[segment] = actuator
+        self.bodyseg_to_mjcfactuator.update(return_dict)
         self._rebuild_neutral_keyframe()
         return return_dict
 
@@ -332,7 +373,7 @@ class Fly(BaseCompositionElement):
             "camera",
             name=name,
             mode=mode,
-            target="rootbody",
+            target=self.root_segment.name,
             pos=pos_offset,
             fovy=fovy,
             **rotation.as_kwargs(),
@@ -370,9 +411,10 @@ class Fly(BaseCompositionElement):
             rigging_config = yaml.safe_load(f)
 
         # Add root body and geom
-        virtual_root = self.mjcf_root.worldbody.add("body", name="rootbody")
         body, geom = self._add_one_body_and_geom(
-            virtual_root, self.root_segment, rigging_config[self.root_segment.name]
+            self.mjcf_root.worldbody,
+            self.root_segment,
+            rigging_config[self.root_segment.name],
         )
         self.bodyseg_to_mjcfbody[self.root_segment] = body
         self.bodyseg_to_mjcfgeom[self.root_segment] = geom

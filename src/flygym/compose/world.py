@@ -195,7 +195,11 @@ class FlatGroundWorld(BaseWorld):
 
     @override
     def __init__(
-        self, name: str = "flat_ground_world", *, half_size: float = 1000
+        self,
+        name: str = "flat_ground_world",
+        *,
+        half_size: float = 1000,
+        pos: tuple[float, float, float] = (0, 0, 0),
     ) -> None:
         super().__init__(name=name)
 
@@ -221,7 +225,7 @@ class FlatGroundWorld(BaseWorld):
             type="plane",
             name="ground_plane",
             material=grid_material,
-            pos=(0, 0, 0),
+            pos=pos,
             size=(half_size, half_size, 1),
             contype=0,
             conaffinity=0,
@@ -290,7 +294,10 @@ class TetheredWorld(BaseWorld):
 
     @override
     def _attach_fly_mjcf(
-        self, fly, spawn_position: Vec3, spawn_rotation: Rotation3D
+        self,
+        fly: Fly,
+        spawn_position: Vec3,
+        spawn_rotation: Rotation3D,
     ) -> mjcf.Element:
         spawn_site = self.mjcf_root.worldbody.add(
             "site", name=fly.name, pos=spawn_position, **spawn_rotation.as_kwargs()
@@ -299,7 +306,7 @@ class TetheredWorld(BaseWorld):
         self.mjcf_root.equality.add(
             "weld",
             body2="world",  # worldbody is called "world" in equality constraints
-            body1=fly.mjcf_root.find("body", "rootbody").full_identifier,
+            body1=fly.mjcf_root.find("body", fly.root_segment.name).full_identifier,
             relpose=(*spawn_position, *spawn_rotation.values),
             solref=(2e-4, 1.0),
             solimp=(0.98, 0.99, 1e-5, 0.5, 3),

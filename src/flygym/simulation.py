@@ -173,6 +173,16 @@ class Simulation:
                         internal_actuator_id
                     )
 
+            for actuator_element in fly.bodyseg_to_mjcfactuator.values():
+                internal_actuator_id = mujoco.mj_name2id(
+                    self.mj_model,
+                    mujoco.mjtObj.mjOBJ_ACTUATOR,
+                    actuator_element.full_identifier,
+                )
+                internal_actuatorids_by_fly_by_type[ActuatorType.ADHESION][
+                    fly_name
+                ].append(internal_actuator_id)
+
         self._intern_actuatorids_by_type_by_fly = {
             actuator_ty: {
                 fly_name: np.array(ids, dtype=np.int32)
