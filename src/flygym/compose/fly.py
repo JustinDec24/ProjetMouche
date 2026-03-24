@@ -115,6 +115,8 @@ class Fly(BaseCompositionElement):
         self.cameraname_to_mjcfcamera = {}
         self.eyecameraname_to_mjcfcamera = {}
         self.hiddenbodyseg_to_mjcfgeom = {}
+        self.contactbodyseg_to_mjcfbody = {}
+        self.adhesionbodyseg_to_mjcfgeom = {}
 
         self.jointdof_to_neutralangle = {}
         self.jointdof_to_neutralaction_by_type = {ty: {} for ty in ActuatorType}
@@ -419,6 +421,11 @@ class Fly(BaseCompositionElement):
             )
             return_dict[segment] = actuator
         self.bodyseg_to_mjcfactuator.update(return_dict)
+
+        adhesionbodyseg_to_mjcfgeom = {
+            segment: self.mjcf_root.find("geom", segment.name) for segment in segments
+        }
+        self.adhesionbodyseg_to_mjcfgeom.update(adhesionbodyseg_to_mjcfgeom)
         self._rebuild_neutral_keyframe()
         return return_dict
 
@@ -444,6 +451,38 @@ class Fly(BaseCompositionElement):
         for segment, geom in self.bodyseg_to_mjcfgeom.items():
             vis_set_name = lookup[segment]
             geom.set_attributes(material=vis_set_name)
+
+    def add_force_sensors(self):
+        """
+        Add force sensors to the tracked bodies
+        Without them the cfrc_ext is zero
+        Returns
+        -------
+        All force sensors
+        """
+        return_dict = {}
+        for body_name in [
+            "lf_tarsus5",
+            "lm_tarsus5",
+            "lh_tarsus5",
+            "rf_tarsus5",
+            "rm_tarsus5",
+            "rh_tarsus5",
+        ]:
+            body = self.mjcf_root.find("body", body_name)
+            site = body.add(
+                "site",
+                name=f"{body_name}_site",
+                pos=[0, 0, 0],
+                size=np.ones(3) * 0.005,
+            )
+            self.mjcf_root.sensor.add(
+                "force", name=f"force_{body.name}", site=site.name
+            )
+            return_dict[body_name] = body
+
+        self.contactbodyseg_to_mjcfbody.update(return_dict)
+        return return_dict
 
     def add_tracking_camera(
         self,

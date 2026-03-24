@@ -32,6 +32,8 @@ class Simulation:
         self._map_internal_odor_sensor_ids()
         self._map_internal_eye_camera_ids()
         self._map_internal_hidden_segment_ids()
+        self._map_internal_contact_body_segment_ids()
+        self._map_internal_adhesion_geom_ids()
 
         # For performance profiling
         self._curr_step = 0
@@ -127,6 +129,34 @@ class Simulation:
             return getattr(self.world, "get_olfaction")(sensor_positions)
         else:
             raise NotImplementedError("The current world does not support olfaction.")
+
+    def get_adhesion_force_magnitudes(
+        self, fly_name: str
+    ) -> Float[np.ndarray, "n_contact_sensors"]:
+        adhesion_actuator_ids = self._intern_actuatorids_by_type_by_fly[
+            ActuatorType.ADHESION
+        ][fly_name]
+        return self.mj_data.actuator_force[adhesion_actuator_ids]
+
+    def get_external_force(
+        self,
+        fly_name: str,
+        subtract_adhesion_force: bool,
+    ) -> Float[np.ndarray, "n_contact_sensors 3"]:
+        body_ids = self._internal_contact_body_segment_ids_by_fly[fly_name]
+        contact_forces = self.mj_data.cfrc_ext[body_ids, 3:]
+
+        if subtract_adhesion_force:
+            adhesion_force_magnitudes = self.get_adhesion_force_magnitudes(fly_name)
+            adhesion_geom_ids = self._intern_adhesion_geom_ids_by_fly[fly_name]
+
+            for i, geom_id in enumerate(adhesion_geom_ids):
+                mask = self.mj_data.contact.geom2 == geom_id
+                if mask.any():
+                    normal = self.mj_data.contact.frame[mask, :3].mean(0)
+                    contact_forces[i] -= normal * adhesion_force_magnitudes[i]
+
+        return contact_forces
 
     @cached_property
     def eye_renderer(self):
@@ -315,6 +345,42 @@ class Simulation:
         self._intern_hidden_segment_ids_by_fly = {
             k: np.array(v, dtype=np.int32)
             for k, v in internal_hidden_segment_ids_by_fly.items()
+        }
+
+    def _map_internal_contact_body_segment_ids(self):
+        internal_contact_body_segment_ids_by_fly = defaultdict(list)
+
+        for fly_name, fly in self.world.fly_lookup.items():
+            for body_segment in fly.contactbodyseg_to_mjcfbody.values():
+                internal_body_segment_id = mujoco.mj_name2id(
+                    self.mj_model,
+                    mujoco.mjtObj.mjOBJ_BODY,
+                    body_segment.full_identifier,
+                )
+                internal_contact_body_segment_ids_by_fly[fly_name].append(
+                    internal_body_segment_id
+                )
+
+        self._internal_contact_body_segment_ids_by_fly = {
+            k: np.array(v, dtype=np.int32)
+            for k, v in internal_contact_body_segment_ids_by_fly.items()
+        }
+
+    def _map_internal_adhesion_geom_ids(self):
+        internal_adhesion_geom_ids_by_fly = defaultdict(list)
+
+        for fly_name, fly in self.world.fly_lookup.items():
+            for geom in fly.adhesionbodyseg_to_mjcfgeom.values():
+                internal_geom_id = mujoco.mj_name2id(
+                    self.mj_model,
+                    mujoco.mjtObj.mjOBJ_GEOM,
+                    geom.full_identifier,
+                )
+                internal_adhesion_geom_ids_by_fly[fly_name].append(internal_geom_id)
+
+        self._intern_adhesion_geom_ids_by_fly = {
+            k: np.array(v, dtype=np.int32)
+            for k, v in internal_adhesion_geom_ids_by_fly.items()
         }
 
     @property
