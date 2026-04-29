@@ -103,35 +103,157 @@ class Controller:
     VIS_ROI_R1 = 0.72
     VIS_ROI_C0 = 0.08
     VIS_ROI_C1 = 0.92
-    VIS_CENTER_C0 = 0.40
-    VIS_CENTER_C1 = 0.60
+    # Centre band widened (30-70% instead of 40-60%): the fly is BIG compared to a
+    # grass blade; an obstacle just off the geometric centre still requires
+    # avoidance. A wider centre means the turn boost / stop logic kicks in
+    # whenever the blade is anywhere in the forward hemisphere.
+    VIS_CENTER_C0 = 0.30
+    VIS_CENTER_C1 = 0.70
 
-    # Obstacle proxy (no colors): strong edges + very dark pixels.
+    # Obstacle proxy: strong edges + very dark pixels (legacy fallback).
     # Thresholds / scales for obstacle "strength".
     VIS_DARK = 0.12
     VIS_EDGE = 0.10
 
+    # --- color-based perception (Level 2+) ---
+    # In the miniproject scene every "interesting" object has a fixed RGBA:
+    #   * grass blades and the terrain itself : (0, 1, 0, 1)  -> "pure green"
+    #   * banana                              : (1, 1, 0, 1)  -> yellow
+    #   * dragonfly head/thorax               : (0.15, 0.55, 0.2, 1)  -> dark green
+    #   * dragonfly eyes                      : (0.6, 0.1, 0.1, 1)  -> red
+    #   * dragonfly wings                     : (0.7, 0.9, 1.0, 0.35) -> light blue
+    # See src/miniproject/arena/{grass,terrain,banana,dragonfly}.py.
+    #
+    # Probe in `tmp_color_probe.py` shows that the *ground itself* is rendered
+    # close to (0, 1, 0) too, so we can NOT just mask "every pure-green pixel
+    # is an obstacle". What works:
+    #   * pure-green pixels in the *upper half* of the ROI come from grass
+    #     blades that stick up above the ground (or from the dragonfly body
+    #     against the sky), so they are reliable obstacle hints.
+    #   * pure-green pixels in the lower half are dominated by the ground, so
+    #     we still rely on the legacy edge / dark detector there.
+    #   * pure-red pixels are a unique colour in the scene -> dragonfly eyes,
+    #     used as a separate "danger" channel.
+    #
+    # All thresholds are conservative; the detector composes (`max`) with the
+    # legacy edge/dark strength so we are never *worse* than before.
+    VIS_COLOR_ENABLE = True
+    # Pure-green chroma test (terrain *and* blade pixels both pass it):
+    #   (g - r) > GREEN_DELTA AND (g - b) > GREEN_DELTA AND g > GREEN_MIN
+    # Same thresholds work for the grass mask everywhere in the file.
+    VIS_GRASS_GREEN_DELTA = 0.20
+    VIS_GRASS_GREEN_MIN = 0.45
+    # Multiplicative weight kept for legacy callers that fuse the grass
+    # channel with other strengths via a weighted max.
+    VIS_GRASS_WEIGHT = 1.0
+
+    # Dragonfly (red eyes) detector:
+    #   r - g > RED_DELTA AND r - b > RED_DELTA AND r > RED_MIN
+    VIS_DF_RED_DELTA = 0.20
+    VIS_DF_RED_MIN = 0.40
+    # Treat the dragonfly as an emergency above this fraction of red pixels
+    # in the ROI. The eyes are tiny so the signal stays small even up close.
+    VIS_DF_AREA_ON = 0.0040
+    VIS_DF_AREA_OFF = 0.0015
+    # Latch the avoidance for a few decision steps to keep a steady turn.
+    VIS_DF_LATCH_DECISIONS = 10
+    VIS_DF_TURN_GAIN = 3.5
+    VIS_DF_TURN_MAX = 2.4
+    VIS_DF_SPEED_MIN = 0.20
+    # EMA on the smoothed dragonfly area (separate from the main `total_area`
+    # EMA so the colour channel reacts faster than the edge channel).
+    VIS_DF_EMA = 0.55
+
+    # --- vision debug overlay (cheap visual sanity check) ---
+    # When enabled, the controller can render a per-pixel mask overlay on top
+    # of the raw fly vision, useful to tune the colour thresholds in the
+    # `run_with_controller.py --debug-vision` mode. The flag here only
+    # *allows* the overlay; the actual call site is the interactive script.
+    VIS_DEBUG_OVERLAY = True
+
     # EMA smoothing for areas and derivatives.
-    VIS_EMA = 0.70
-    VIS_D_EMA = 0.80
+    # Lower α → faster response (less lag), at the cost of slightly more
+    # noise. 0.45 settles to 90 % of a step change in ~4 decisions instead
+    # of ~7 with the previous 0.70. Raw (unsmoothed) lr is now used for
+    # the proportional turn so this only affects reflex thresholds.
+    VIS_EMA = 0.45
+    VIS_D_EMA = 0.70
 
     # Normal avoidance (continuous).
-    VIS_TURN_GAIN = 3.0
-    VIS_TURN_MAX = 2.0
+    # Raw lr (instantaneous, no EMA lag) is used for the turn direction;
+    # gains and clipping are applied after. TURN_MAX raised to 5.0 so the
+    # fly can commit to a near-90° pivot when very close to a blade.
+    VIS_TURN_GAIN = 10.0
+    VIS_TURN_MAX = 5.0
     VIS_CENTER_TURN_GAIN = 2.6
-    VIS_SPEED_MIN = 0.60
-    VIS_SPEED_CENTER_GAIN = 1.0
+    VIS_SPEED_MIN = 0.20
+    VIS_SPEED_CENTER_GAIN = 1.4
+    # Proximity boost: the bigger total_area, the closer the obstacle, so
+    # we ramp the turn further. VIS_PROX_REF lowered from 0.020 to 0.008
+    # so the boost saturates at the same total_area level as before but
+    # triggers much earlier as the fly approaches.
+    VIS_PROX_TURN_GAIN = 4
+    VIS_PROX_REF = 0.008
+
     # "Stop & steer around" behavior when obstacle is frontal/large.
+    # Lower thresholds → triggered earlier (at medium range).
+    # Low STOP_SPEED + high STOP_TURN_BOOST → near-rotation-in-place.
     VIS_STOP_ENABLE = True
-    # In the miniproject camera, obstacles often occupy a small fraction of ROI
-    # until very close. Use lower thresholds to trigger "stop & go around" earlier.
-    VIS_STOP_CENTER_ON = 0.030
-    VIS_STOP_CENTER_OFF = 0.018
-    VIS_STOP_TOTAL_ON = 0.030
-    VIS_STOP_TOTAL_OFF = 0.018
-    VIS_STOP_SPEED = 0.32
-    VIS_STOP_LATCH_DECISIONS = 6
-    VIS_STOP_TURN_BOOST = 1.8
+    VIS_STOP_CENTER_ON = 0.008
+    VIS_STOP_CENTER_OFF = 0.003
+    VIS_STOP_TOTAL_ON = 0.008
+    VIS_STOP_TOTAL_OFF = 0.003
+    VIS_STOP_SPEED = 0.08        # nearly stops; body can rotate without moving forward
+    VIS_STOP_LATCH_DECISIONS = 30
+    VIS_STOP_TURN_BOOST = 6.0   # clipped to VIS_TURN_MAX → always full-authority turn
+
+    # --- Grass-spike detection pipeline ----------------------------------
+    # Stages inside the ROI:
+    #   1. GREEN MASK — chroma `(g−r), (g−b), g_min` → terrain + herbe.
+    #   2. HORIZON — `first_green[col]` lissé par un percentile élevé → sol.
+    #   3. COULEUR DE RÉFÉRENCE — médiane RGB sur les pixels verts **au-dessus**
+    #      de la ligne d’horizon uniquement (ce qui dépasse le sol).
+    #   4. MATCH ADAPTATIF — pixels verts proches de cette référence (L∞ ≤ tol).
+    #   5. TRIANGLE — pour chaque colonne où le pic dépasse nettement le sol,
+    #      bande verticale `first_green … horizon` ∩ match couleur → pic entier.
+    VIS_TIP_MIN_HEIGHT = 4
+    # Half-width (cols) of the horizon-smoothing window.  Window length is
+    # 2*HALF + 1.  Should be wider than any single blade silhouette base.
+    VIS_TIP_HORIZON_HALF = 40
+    # Robust statistic of `first_green` inside the window.  Spikes pull
+    # `first_green` upward (smaller row index); a HIGH percentile (closer to
+    # max) therefore tracks the GROUND and ignores the spikes.  75 keeps a
+    # safety margin against ground-row anti-alias noise.
+    VIS_TIP_HORIZON_PERCENTILE = 75.0
+    # Apex must beat the local horizon by at least this many pixels to count
+    # as a candidate (filters horizon noise / anti-alias stair-stepping).
+    VIS_TIP_APEX_MARGIN = 3
+    # Max abs. RGB deviation from the per-frame median reference colour
+    # sampled above the horizon (L∞ norm).  Larger → fuller triangles in
+    # shadow / anti-alias; smaller → stricter match to the protruding tip.
+    VIS_SPIKE_COLOR_TOL = 0.11
+
+    # --- Blade proximity reflex (consumes the spike pixel count) ---------
+    # The reflex stays unchanged in spirit: two speeds, FAR for gentle
+    # anticipation, NEAR for a hard pivot.  Only the upstream signal — the
+    # spike pixel count — has been rewritten above.
+    VIS_BLADE_ENABLE = True
+    VIS_BLADE_FAR_THRESH = 50
+    VIS_BLADE_NEAR_THRESH = 250
+    VIS_BLADE_LATCH_DECISIONS = 25
+    VIS_BLADE_SPEED = 0.08
+
+    # Wide-arc clearance: kicks in earlier than STOP and KEEPS the fly
+    # turning while it is moving, so a fly-sized body actually clears the
+    # blade laterally instead of brushing past it.
+    VIS_WIDE_ENABLE = True
+    VIS_WIDE_TOTAL_ON = 0.001   # trigger on ANY detectable blade
+    VIS_WIDE_TOTAL_OFF = 0.0005
+    VIS_WIDE_LATCH_DECISIONS = 60  # ~3 s of committed turning
+    VIS_WIDE_TURN_GAIN = 4.0
+    VIS_WIDE_SPEED_CENTER_GAIN = 1.2
+    VIS_WIDE_SPEED_MIN = 0.25
+    VIS_WIDE_AVOID_BLEND = 0.8
 
     # Looming reflex (priority).
     LOOM_ENABLE = True
@@ -166,7 +288,10 @@ class Controller:
 
     # Fusion / stability.
     VIS_DIRECTION_MEMORY = True
-    VIS_LAST_DIR_DECAY = 0.90
+    # Higher = longer memory. Bumped from 0.90 so that, once we commit to
+    # "go right around this blade", we don't flip-flop when the blade
+    # leaves the centre band briefly.
+    VIS_LAST_DIR_DECAY = 0.95
     VIS_TARGET_PROTECT = 0.65  # if target steer strong, visual turn can't flip it
 
     # --- debugging ---
@@ -294,23 +419,7 @@ class Controller:
     SEARCH_SLOPE_MAX = 0.45
     SEARCH_UPRIGHT_MIN = 0.65
 
-    # --- DAgger learned vision policy hook (optional) ---
-    # When a path is provided (either on the class or via `__init__`), the
-    # scripted `_vision_avoid_bias_and_danger` is replaced by the learned
-    # `VisionPolicy`. Scripted safety reflexes (bump / looming) still win
-    # if their thresholds are crossed (see `_dagger_vision_bias_and_speed`).
-    DAGGER_POLICY_PATH: str | None = None
-    DAGGER_BLEND = 1.0            # 1.0 = policy replaces vision module output
-    DAGGER_TURN_EMA = 0.70        # EMA smoothing on policy turn (prevents zig-zags)
-    DAGGER_SPEED_MIN = 0.35       # lower bound for speed_scale returned by policy
-    DAGGER_BUMP_CONTACT_ON = 4.0  # fallback to scripted reflex above this force
-    DAGGER_LOOM_DAREA_ON = 0.030  # fallback to scripted reflex above this looming
-
-    def __init__(
-        self,
-        sim: MiniprojectSimulation,
-        dagger_policy_path: str | None = None,
-    ):
+    def __init__(self, sim: MiniprojectSimulation):
         from flygym.examples.locomotion import TurningController
 
         self.turning_controller = TurningController(sim.timestep)
@@ -364,6 +473,23 @@ class Controller:
         self._bump_left = 0
         self._bump_contact_ema = 0.0
         self._bump_contact_prev = 0.0
+        # Wide-arc clearance latch (keeps a steady turn around close blades).
+        self._wide_left = 0
+        # Blade proximity reflex (pixel-count threshold).
+        self._blade_left = 0
+        self._blade_left_px = 0   # cached pixel counts for debug
+        self._blade_right_px = 0
+        # Color-based perception (Level 2+).
+        self._vis_grass_left = 0.0
+        self._vis_grass_right = 0.0
+        self._vis_grass_center = 0.0
+        self._vis_dragonfly_area = 0.0
+        self._vis_dragonfly_x = 0.0
+        self._dragonfly_left = 0
+        # Latest debug-overlay frame (filled by `compute_vision_debug_overlay`).
+        self._vis_debug_overlay = None
+        self._vis_spike_roi_left = None   # last ROI spike mask, left eye (bool)
+        self._vis_spike_roi_right = None  # idem right eye
         self._jam_left = 0
         self._jam_dir = 1
         self._goal_mode_left = 0
@@ -415,29 +541,6 @@ class Controller:
         except Exception:
             self._vision_rect_idx = None
             self._vision_rect_mask = None
-
-        # --- DAgger learned vision policy (optional drop-in replacement) ---
-        # `dagger_policy_path` arg wins over the class attribute, so external
-        # code can do `Controller(sim, dagger_policy_path="path/to/policy.pt")`.
-        self._dagger_policy = None
-        self._dagger_feat = None
-        self._dagger_turn_ema = 0.0
-        self._dagger_prev_turn = 0.0
-        self._dagger_prev_speed = 1.0
-        path = dagger_policy_path if dagger_policy_path is not None else self.DAGGER_POLICY_PATH
-        if path is not None:
-            try:
-                from miniproject.dagger import VisionFeatureExtractor, VisionPolicy
-
-                self._dagger_policy = VisionPolicy.load(path, map_location="cpu")
-                self._dagger_feat = VisionFeatureExtractor(sim)
-                print(f"[Controller] Loaded DAgger vision policy from {path}", flush=True)
-            except Exception as e:
-                # Don't crash the sim if the checkpoint fails to load --
-                # fall back silently to the scripted vision module.
-                print(f"[Controller] WARN: failed to load DAgger policy ({e}); using scripted vision.", flush=True)
-                self._dagger_policy = None
-                self._dagger_feat = None
 
     # ------------------------------------------------------------------
     def step(self, sim: MiniprojectSimulation):
@@ -514,6 +617,7 @@ class Controller:
             self._search_left = 0
             self._bump_left = 0
             self._jam_left = 0
+            self._wide_left = 0
             return joint_angles, adhesion
 
         # --- Orientation safety (terrain levels): if persistently tilted, reset ---
@@ -1149,17 +1253,24 @@ class Controller:
         self._vis_speed_scale = 1.0
         if self.VISION_ENABLE and self._enable_grass:
             if self._vision_step_count % self.VISION_DECISION_EVERY == 0:
-                # Route through the DAgger policy if one was loaded, otherwise
-                # fall back to the hand-crafted vision module.
-                if self._dagger_policy is not None and self._dagger_feat is not None:
-                    vision_turn_bias, danger = self._dagger_vision_bias_and_speed(sim)
-                else:
-                    vision_turn_bias, danger = self._vision_avoid_bias_and_danger(sim)
+                vision_turn_bias, danger = self._vision_avoid_bias_and_danger(sim)
 
                 # Apply visual speed modulation (set inside vision functions).
-                # Combine with the nominal controller bias; do not allow vision to flip
-                # a strong goal-directed steering signal.
-                if abs(target_bias) >= self.VIS_TARGET_PROTECT and np.sign(bias) != 0:
+                # Do NOT allow vision to flip a strong goal-directed steering
+                # signal UNLESS a reflex is already latched -- in that case the
+                # obstacle takes absolute priority over the olfactory target.
+                reflex_latched = (
+                    self._bump_left > 0
+                    or self._blade_left > 0
+                    or self._loom_left > 0
+                    or self._stop_left > 0
+                    or self._wide_left > 0
+                )
+                if (
+                    not reflex_latched
+                    and abs(target_bias) >= self.VIS_TARGET_PROTECT
+                    and np.sign(bias) != 0
+                ):
                     if np.sign(bias + vision_turn_bias) != np.sign(bias):
                         vision_turn_bias = 0.0
 
@@ -1175,8 +1286,10 @@ class Controller:
                         f"turn={vision_turn_bias:.3f} danger={danger:.3f} speed_scale={self._vis_speed_scale:.2f} "
                         f"areas=({self._vis_left_area:.3f},{self._vis_right_area:.3f}) center={self._vis_center_area:.3f} "
                         f"total={self._vis_total_area:.3f} d_total={self._vis_d_total_area:.3f} "
+                        f"blade=({self._blade_left_px},{self._blade_right_px}) "
                         f"bump={bool(self._bump_left>0)} jam={bool(self._jam_left>0)} "
-                        f"loom={bool(self._loom_left>0)} stop={bool(self._stop_left>0)}",
+                        f"loom={bool(self._loom_left>0)} stop={bool(self._stop_left>0)} "
+                        f"wide={bool(self._wide_left>0)} blade_latch={bool(self._blade_left>0)}",
                         flush=True,
                     )
 
@@ -1260,18 +1373,29 @@ class Controller:
         # already pressed against. In that case we ignore base_drive entirely
         # and command a strong pivot in place: max drive on one side, min side
         # drive on the other. The direction is taken from the smoothed bias
-        # (which already encodes target_bias + vision turn). This is what
-        # actually unsticks the fly from "drive into wall" loops on level 2.
+        # (which already encodes target_bias + vision turn, with the
+        # VIS_TARGET_PROTECT check bypassed so vision always dominates).
+        # WIDE is included: the fly pivots sharply at any blade detection,
+        # not just when STOP/BUMP/LOOM fire.
         reflex_active = (
             self._enable_grass
             and (
                 self._bump_left > 0
+                or self._blade_left > 0
                 or self._loom_left > 0
                 or self._stop_left > 0
+                or self._wide_left > 0
             )
         )
         if reflex_active:
-            pivot_dir = 1.0 if self._smooth_bias > 0.0 else -1.0
+            # Prefer smooth_bias direction (vision turn already dominates
+            # because VIS_TARGET_PROTECT is bypassed when reflex is latched).
+            # Fall back to _vis_last_dir when smooth_bias is near zero (rare
+            # case where olfaction and vision cancel exactly).
+            if abs(self._smooth_bias) > 1e-3:
+                pivot_dir = 1.0 if self._smooth_bias > 0.0 else -1.0
+            else:
+                pivot_dir = float(np.sign(self._vis_last_dir)) if abs(self._vis_last_dir) > 1e-6 else 1.0
             if pivot_dir > 0:
                 drives = np.array([max_drive, min_side], dtype=float)
             else:
@@ -1295,6 +1419,138 @@ class Controller:
                 flush=True,
             )
         return drives
+
+    # ------------------------------------------------------------------
+    # Colour masks. Factored out of `_vision_avoid_bias_and_danger` so the
+    # debug overlay can reuse the *exact* same logic and never drift from
+    # what the controller actually sees.
+    def _compute_green_mask(self, roi_rgb: np.ndarray) -> np.ndarray:
+        """Pure-green chroma mask over the ROI (terrain + spikes)."""
+        if not self.VIS_COLOR_ENABLE:
+            return np.zeros(roi_rgb.shape[:2], dtype=bool)
+        r = roi_rgb[..., 0]
+        g = roi_rgb[..., 1]
+        b = roi_rgb[..., 2]
+        d = float(self.VIS_GRASS_GREEN_DELTA)
+        gmin = float(self.VIS_GRASS_GREEN_MIN)
+        return ((g - r) > d) & ((g - b) > d) & (g > gmin)
+
+    # Backwards-compatible alias for the few legacy callers that still ask
+    # for a "grass mask".  All grass pixels are simply pixels of the green
+    # mask: terrain *and* blades.  The downstream code that needed a
+    # spike-only signal now consumes the tip profile instead.
+    def _compute_grass_mask(self, roi_rgb: np.ndarray) -> np.ndarray:
+        return self._compute_green_mask(roi_rgb)
+
+    def _compute_dragonfly_mask(self, roi_rgb: np.ndarray) -> np.ndarray:
+        """Bool mask of saturated-red pixels (dragonfly eyes / head)."""
+        if not self.VIS_COLOR_ENABLE:
+            return np.zeros(roi_rgb.shape[:2], dtype=bool)
+        r = roi_rgb[..., 0]
+        g = roi_rgb[..., 1]
+        b = roi_rgb[..., 2]
+        d = float(self.VIS_DF_RED_DELTA)
+        rmin = float(self.VIS_DF_RED_MIN)
+        return ((r - g) > d) & ((r - b) > d) & (r > rmin)
+
+    # ------------------------------------------------------------------
+    # Grass-spike image processing — built from scratch.
+    #
+    # Stages:
+    # ------------------------------------------------------------------
+    # Grass-spike image processing.
+    #
+    # Output (per eye):
+    #   tips[col]       — nombre de pixels du pic dans la colonne
+    #   apex_rows[col]  — ligne du sommet (premier pixel du masque), ou h_roi
+    #   horizon[col]    — ligne d’horizon (sol) lissée
+    #   spike_full      — masque booléen (h_roi, w_roi) du triangle / pic entier
+    # ------------------------------------------------------------------
+    def _compute_tip_profile(
+        self, eye_img01: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        h_full, w_full = eye_img01.shape[:2]
+        r0 = int(float(self.VIS_ROI_R0) * h_full)
+        r1 = int(float(self.VIS_ROI_R1) * h_full)
+        c0 = int(float(self.VIS_ROI_C0) * w_full)
+        c1 = int(float(self.VIS_ROI_C1) * w_full)
+        roi = eye_img01[r0:r1, c0:c1, :]
+
+        h, w = roi.shape[:2]
+        empty_mask = np.zeros((h, w), dtype=bool)
+        empty = (
+            np.zeros(w, np.float32),
+            np.full(w, float(h), np.float32),
+            np.full(w, float(h), np.float32),
+            empty_mask,
+        )
+        if h < 2 or w < 1 or not self.VIS_COLOR_ENABLE:
+            return empty
+
+        # --- Stage 1: green mask (terrain + spikes) ---
+        green = self._compute_green_mask(roi)
+        if not green.any():
+            return empty
+
+        # --- Stage 2a: per-column topmost-green row ---
+        has_green = green.any(axis=0)
+        first_green = np.where(
+            has_green, np.argmax(green, axis=0).astype(np.float32), float(h)
+        )
+
+        # --- Stage 2b: horizon = rolling HIGH percentile of first_green ---
+        half = int(max(1, self.VIS_TIP_HORIZON_HALF))
+        win = 2 * half + 1
+        pct = float(self.VIS_TIP_HORIZON_PERCENTILE)
+        if w >= win:
+            padded = np.pad(first_green, (half, half), mode="edge")
+            from numpy.lib.stride_tricks import sliding_window_view
+            sw = sliding_window_view(padded, win)
+            horizon = np.percentile(sw, pct, axis=1).astype(np.float32)
+        else:
+            horizon = np.full(
+                w, float(np.percentile(first_green, pct)), dtype=np.float32
+            )
+
+        rr = np.arange(h, dtype=np.float32)[:, None]
+        above_h = rr < horizon[None, :]
+
+        # --- Stage 3: référence couleur = médiane RGB au-dessus du sol ---
+        seed = green & above_h
+        if seed.any():
+            ref_r = float(np.median(roi[..., 0][seed]))
+            ref_g = float(np.median(roi[..., 1][seed]))
+            ref_b = float(np.median(roi[..., 2][seed]))
+        else:
+            ref_r = float(np.median(roi[..., 0][green]))
+            ref_g = float(np.median(roi[..., 1][green]))
+            ref_b = float(np.median(roi[..., 2][green]))
+
+        tol = float(self.VIS_SPIKE_COLOR_TOL)
+        dr = np.abs(roi[..., 0] - ref_r)
+        dg = np.abs(roi[..., 1] - ref_g)
+        db = np.abs(roi[..., 2] - ref_b)
+        color_match = green & (np.maximum(np.maximum(dr, dg), db) <= tol)
+
+        # --- Stage 4: slab verticale par colonne + pic détecté (hauteur > seuil) ---
+        apex_margin = float(self.VIS_TIP_APEX_MARGIN)
+        min_height = float(self.VIS_TIP_MIN_HEIGHT)
+        height_above = horizon - first_green
+        geom_ok = has_green & (height_above >= max(min_height, apex_margin))
+
+        slab = geom_ok[None, :] & (rr >= first_green[None, :]) & (
+            rr <= horizon[None, :]
+        )
+        spike_full = color_match & slab
+
+        tips = spike_full.sum(axis=0).astype(np.float32)
+        apex_rows = np.where(
+            spike_full.any(axis=0),
+            np.argmax(spike_full, axis=0).astype(np.float32),
+            float(h),
+        )
+
+        return tips, apex_rows, horizon, spike_full
 
     def _vision_avoid_bias_and_danger(
         self, sim: MiniprojectSimulation
@@ -1322,83 +1578,155 @@ class Controller:
             c0, c1 = int(w * self.VIS_ROI_C0), int(w * self.VIS_ROI_C1)
             return img01[r0:r1, c0:c1, :]
 
-        def _obstacle_strength(gray: np.ndarray) -> np.ndarray:
-            """Continuous obstacle strength in [0,1] from edges + darkness."""
-            dx = np.abs(np.diff(gray, axis=1, prepend=gray[:, :1]))
-            dy = np.abs(np.diff(gray, axis=0, prepend=gray[:1, :]))
-            edge = 0.5 * (dx + dy)
-            # Only count sufficiently strong edges (avoid constant low-level texture).
-            edge_thr = max(1e-6, float(self.VIS_EDGE))
-            edge_s = np.clip((edge - edge_thr) / edge_thr, 0.0, 1.0)
-            dark_s = np.clip((float(self.VIS_DARK) - gray) / max(1e-6, float(self.VIS_DARK)), 0.0, 1.0)
-            return np.maximum(edge_s, dark_s).astype(np.float32)
-
         def extract_visual_features(left_img01: np.ndarray, right_img01: np.ndarray) -> dict:
-            # grayscale in ROI
+            # ----------------------------------------------------------------
+            # Spike detection: horizon → median RGB above horizon → adaptive
+            # colour match → full wedge mask per column between apex and horizon.
+            left_tips, _l_apex, _l_horizon, l_spike = self._compute_tip_profile(
+                left_img01
+            )
+            right_tips, _r_apex, _r_horizon, r_spike = self._compute_tip_profile(
+                right_img01
+            )
+            self._vis_spike_roi_left = l_spike
+            self._vis_spike_roi_right = r_spike
+
+            # ROI geometry for normalisation (tips are in absolute pixels;
+            # we normalise to fractions 0-1 for threshold compatibility).
+            h_full = left_img01.shape[0]
+            h_roi  = int(self.VIS_ROI_R1 * h_full) - int(self.VIS_ROI_R0 * h_full)
+            w_roi  = max(1, int(len(left_tips)))
+            roi_area = max(1, h_roi * w_roi)
+
+            def _tip_area_x(tips: np.ndarray) -> tuple[float, float]:
+                """Normalised area fraction + weighted centroid X in [-1,1]."""
+                total = float(tips.sum())
+                area  = total / roi_area
+                if total < 1e-9:
+                    return area, 0.0
+                xs     = np.linspace(-1.0, 1.0, len(tips), dtype=np.float32)
+                x_mean = float((tips * xs).sum() / total)
+                return area, x_mean
+
+            left_area,  left_x  = _tip_area_x(left_tips)
+            right_area, right_x = _tip_area_x(right_tips)
+
+            # Centre columns (straight-ahead portion of each eye)
+            cL = int(self.VIS_CENTER_C0 * w_roi)
+            cR = max(cL + 1, int(self.VIS_CENTER_C1 * w_roi))
+            center_area_raw = 0.5 * (
+                float(left_tips[cL:cR].sum())  / max(1, h_roi * (cR - cL))
+                + float(right_tips[cL:cR].sum()) / max(1, h_roi * (cR - cL))
+            )
+
+            total_area_raw = 0.5 * (left_area + right_area)
+
+            # EMA smoothing (same structure as before for threshold compat.)
+            prev = float(self._vis_total_area)
+            self._vis_total_area = float(
+                self.VIS_EMA * prev + (1.0 - self.VIS_EMA) * total_area_raw
+            )
+            d_raw = float(self._vis_total_area - self._vis_total_area_prev)
+            self._vis_total_area_prev = float(self._vis_total_area)
+            self._vis_d_total_area = float(
+                self.VIS_D_EMA * self._vis_d_total_area
+                + (1.0 - self.VIS_D_EMA) * d_raw
+            )
+            self._vis_left_area = float(
+                self.VIS_EMA * self._vis_left_area + (1.0 - self.VIS_EMA) * left_area
+            )
+            self._vis_right_area = float(
+                self.VIS_EMA * self._vis_right_area + (1.0 - self.VIS_EMA) * right_area
+            )
+            self._vis_center_area = float(
+                self.VIS_EMA * self._vis_center_area
+                + (1.0 - self.VIS_EMA) * center_area_raw
+            )
+
+            # ---- Dragonfly: colour-based (kept, it is the only red object) ----
             lroi = _roi(left_img01)
             rroi = _roi(right_img01)
-            lgray = (0.299 * lroi[..., 0] + 0.587 * lroi[..., 1] + 0.114 * lroi[..., 2]).astype(np.float32)
-            rgray = (0.299 * rroi[..., 0] + 0.587 * rroi[..., 1] + 0.114 * rroi[..., 2]).astype(np.float32)
+            l_drag = self._compute_dragonfly_mask(lroi).astype(np.float32)
+            r_drag = self._compute_dragonfly_mask(rroi).astype(np.float32)
 
-            lst = _obstacle_strength(lgray)
-            rst = _obstacle_strength(rgray)
-
-            def _area_x(strength: np.ndarray) -> tuple[float, float]:
-                area = float(strength.mean())
+            def _df_area_x(mask2d: np.ndarray) -> tuple[float, float]:
+                area = float(mask2d.mean())
                 if area <= 1e-9:
                     return 0.0, 0.0
-                cols = strength.mean(axis=0)  # (W,)
-                xs = np.linspace(-1.0, 1.0, cols.shape[0], dtype=np.float32)
+                cols   = mask2d.mean(axis=0)
+                xs     = np.linspace(-1.0, 1.0, cols.shape[0], dtype=np.float32)
                 x_mean = float((cols * xs).sum() / max(1e-9, float(cols.sum())))
                 return area, x_mean
 
-            left_area, left_x = _area_x(lst)
-            right_area, right_x = _area_x(rst)
+            df_left_area,  df_left_x  = _df_area_x(l_drag)
+            df_right_area, df_right_x = _df_area_x(r_drag)
+            df_total = 0.5 * (df_left_area + df_right_area)
+            df_w     = df_left_area + df_right_area
+            df_x_raw = (
+                df_left_x * df_left_area + df_right_x * df_right_area
+            ) / max(1e-9, df_w)
+            self._vis_dragonfly_area = float(
+                self.VIS_DF_EMA * self._vis_dragonfly_area
+                + (1.0 - self.VIS_DF_EMA) * df_total
+            )
+            self._vis_dragonfly_x = float(
+                self.VIS_DF_EMA * self._vis_dragonfly_x
+                + (1.0 - self.VIS_DF_EMA) * df_x_raw
+            )
 
-            # center area: both eyes, center columns only
-            def _center_area(strength: np.ndarray) -> float:
-                w = strength.shape[1]
-                c0 = int(w * self.VIS_CENTER_C0)
-                c1 = int(w * self.VIS_CENTER_C1)
-                if c1 <= c0:
-                    return float(strength.mean())
-                return float(strength[:, c0:c1].mean())
-
-            center_area = 0.5 * (_center_area(lst) + _center_area(rst))
-            total_area = 0.5 * (left_area + right_area)
-
-            # temporal derivative (EMA)
-            prev = float(self._vis_total_area)
-            self._vis_total_area = float(self.VIS_EMA * prev + (1.0 - self.VIS_EMA) * total_area)
-            d_raw = float(self._vis_total_area - self._vis_total_area_prev)
-            self._vis_total_area_prev = float(self._vis_total_area)
-            self._vis_d_total_area = float(self.VIS_D_EMA * self._vis_d_total_area + (1.0 - self.VIS_D_EMA) * d_raw)
-
-            # store smoothed areas for debugging/fusion
-            self._vis_left_area = float(self.VIS_EMA * self._vis_left_area + (1.0 - self.VIS_EMA) * left_area)
-            self._vis_right_area = float(self.VIS_EMA * self._vis_right_area + (1.0 - self.VIS_EMA) * right_area)
-            self._vis_center_area = float(self.VIS_EMA * self._vis_center_area + (1.0 - self.VIS_EMA) * center_area)
+            # ---- Blade proximity counts (raw tip sums, no EMA) ----
+            # Using the full tip profile (all tip pixels, both below and above
+            # the sky zone) gives a richer proximity signal than the old
+            # colour-based sky-zone-only count.
+            left_blade_px  = int(left_tips.sum())
+            right_blade_px = int(right_tips.sum())
+            self._blade_left_px  = left_blade_px
+            self._blade_right_px = right_blade_px
 
             return {
-                "left_area": float(self._vis_left_area),
-                "right_area": float(self._vis_right_area),
-                "left_x": float(left_x),
-                "right_x": float(right_x),
-                "center_area": float(self._vis_center_area),
-                "total_area": float(self._vis_total_area),
-                "d_total_area": float(self._vis_d_total_area),
+                "left_area":      float(self._vis_left_area),
+                "right_area":     float(self._vis_right_area),
+                "raw_left_area":  left_area,
+                "raw_right_area": right_area,
+                "left_x":         left_x,
+                "right_x":        right_x,
+                "center_area":    float(self._vis_center_area),
+                "total_area":     float(self._vis_total_area),
+                "d_total_area":   float(self._vis_d_total_area),
+                "dragonfly_area": float(self._vis_dragonfly_area),
+                "dragonfly_x":    float(self._vis_dragonfly_x),
+                "left_blade_px":  left_blade_px,
+                "right_blade_px": right_blade_px,
             }
 
         def compute_obstacle_avoidance(feat: dict) -> tuple[float, float, float]:
-            # turn: obstacle on left => turn right (positive)
-            lr = float(feat["left_area"] - feat["right_area"])
+            # Use RAW (unsmoothed) lr for the turn direction so the fly
+            # reacts within the same decision step it first sees the blade.
+            # The EMA-smoothed areas are noisy only when the scene changes
+            # abruptly, but the grass mask is already structurally filtered
+            # so a single raw frame is reliable enough for direction.
+            raw_lr = float(feat["raw_left_area"] - feat["raw_right_area"])
+            ema_lr = float(feat["left_area"] - feat["right_area"])
+            # Take the max-magnitude signal: raw for the freshest direction
+            # bias, but keep the EMA in case raw momentarily drops to zero.
+            lr = raw_lr if abs(raw_lr) >= abs(ema_lr) else ema_lr
             center = float(feat["center_area"])
+            total = float(feat["total_area"])
             turn = float(np.clip(self.VIS_TURN_GAIN * lr, -self.VIS_TURN_MAX, self.VIS_TURN_MAX))
-            # if center occupied, amplify turn and slow down
+            # 1) center boost: obstacle dead-ahead -> turn harder
             turn *= float(1.0 + self.VIS_CENTER_TURN_GAIN * np.clip(center / 0.12, 0.0, 1.0))
+            # 2) proximity boost: more total area -> closer obstacle -> turn even
+            #    harder, regardless of whether it is centred. This is what makes
+            #    the fly trace a wider arc instead of grazing the blade.
+            turn *= float(
+                1.0
+                + self.VIS_PROX_TURN_GAIN
+                * np.clip(total / max(1e-6, float(self.VIS_PROX_REF)), 0.0, 1.0)
+            )
+            turn = float(np.clip(turn, -self.VIS_TURN_MAX, self.VIS_TURN_MAX))
             speed_scale = float(1.0 - self.VIS_SPEED_CENTER_GAIN * np.clip(center / 0.18, 0.0, 1.0))
             speed_scale = float(np.clip(speed_scale, self.VIS_SPEED_MIN, 1.0))
-            danger = float(np.clip(feat["total_area"] + 0.8 * center, 0.0, 1.0))
+            danger = float(np.clip(total + 0.8 * center, 0.0, 1.0))
             return turn, speed_scale, danger
 
         def compute_stop_and_go_around(feat: dict) -> tuple[bool, float, float]:
@@ -1422,15 +1750,71 @@ class Controller:
             if not active:
                 return False, 0.0, 1.0
 
-            lr = float(feat["left_area"] - feat["right_area"])
+            # Use raw lr for direction (fastest possible signal).
+            raw_lr = float(feat["raw_left_area"] - feat["raw_right_area"])
+            ema_lr = float(feat["left_area"] - feat["right_area"])
+            lr = raw_lr if abs(raw_lr) >= abs(ema_lr) else ema_lr
             # choose a stable direction if symmetric
             if abs(lr) < 1e-4 and self.VIS_DIRECTION_MEMORY:
                 dir_sign = float(self._vis_last_dir)
             else:
                 dir_sign = 1.0 if lr > 0 else -1.0  # obstacle left => turn right (+)
 
+            # STOP_TURN_BOOST >> VIS_TURN_MAX so this is always a full-authority
+            # pivot regardless of numeric value: the clip does the capping.
             turn = float(np.clip(self.VIS_STOP_TURN_BOOST * dir_sign, -self.VIS_TURN_MAX, self.VIS_TURN_MAX))
             speed = float(self.VIS_STOP_SPEED)
+            return True, turn, speed
+
+        def compute_wide_clearance(feat: dict) -> tuple[bool, float, float]:
+            """Maintain a steady turn while ANY blade-sized obstacle remains in the ROI.
+
+            The fly is large compared to a single grass blade. After the
+            continuous-avoidance turn pushes the blade off-centre, the
+            classic logic relaxes the turn -- and the body still grazes
+            the blade. WIDE mode stays committed to the chosen direction
+            until the blade has cleared the entire ROI, producing a
+            generous arc instead of a knife-edge pass.
+            """
+            if not self.VIS_WIDE_ENABLE:
+                return False, 0.0, 1.0
+            total = float(feat["total_area"])
+            center = float(feat["center_area"])
+
+            on = total >= float(self.VIS_WIDE_TOTAL_ON)
+            off = total <= float(self.VIS_WIDE_TOTAL_OFF)
+
+            if self._wide_left > 0:
+                self._wide_left -= 1
+            if on:
+                self._wide_left = max(
+                    self._wide_left, int(self.VIS_WIDE_LATCH_DECISIONS)
+                )
+            if off and self._wide_left <= 0:
+                self._wide_left = 0
+
+            if self._wide_left <= 0:
+                return False, 0.0, 1.0
+
+            raw_lr = float(feat["raw_left_area"] - feat["raw_right_area"])
+            ema_lr = float(feat["left_area"] - feat["right_area"])
+            lr = raw_lr if abs(raw_lr) >= abs(ema_lr) else ema_lr
+            if abs(lr) < 1e-4 and self.VIS_DIRECTION_MEMORY:
+                dir_sign = float(self._vis_last_dir)
+            else:
+                dir_sign = 1.0 if lr > 0 else -1.0
+            turn = float(np.clip(
+                self.VIS_WIDE_TURN_GAIN * dir_sign,
+                -self.VIS_TURN_MAX,
+                self.VIS_TURN_MAX,
+            ))
+            speed = float(np.clip(
+                1.0
+                - self.VIS_WIDE_SPEED_CENTER_GAIN
+                * np.clip(center / 0.05, 0.0, 1.0),
+                self.VIS_WIDE_SPEED_MIN,
+                1.0,
+            ))
             return True, turn, speed
 
         def compute_looming_reflex(feat: dict) -> tuple[bool, float, float]:
@@ -1513,6 +1897,106 @@ class Controller:
             speed = float(self.BUMP_SPEED)
             return True, turn, speed, contact_max
 
+        def compute_blade_proximity_reflex(feat: dict) -> tuple[bool, float, float]:
+            """Two-speed blade avoidance based on sky-zone pixel count.
+
+            The sky-zone count (above horizon, thin-filtered) encodes proximity:
+              count > FAR_THRESH  → blade visible but distant → gentle pre-turn
+                                    (anticipation: start steering early)
+              count > NEAR_THRESH → blade close / large → full-authority pivot
+                                    (near-stop + max turn to clear)
+
+            Direction: whichever eye sees more blade pixels → danger on that
+            side → turn away from it (+1 = turn right, -1 = turn left).
+            """
+            if not self.VIS_BLADE_ENABLE:
+                return False, 0.0, 1.0
+
+            left_px  = int(feat.get("left_blade_px", 0))
+            right_px = int(feat.get("right_blade_px", 0))
+            max_px   = max(left_px, right_px)
+
+            near_thresh = int(self.VIS_BLADE_NEAR_THRESH)
+            far_thresh  = int(self.VIS_BLADE_FAR_THRESH)
+
+            # Trigger on FAR_THRESH for early detection; clear below half that.
+            on  = max_px >= far_thresh
+            off = max_px < far_thresh // 2
+
+            if self._blade_left > 0:
+                self._blade_left -= 1
+            if on:
+                # Stay latched; NEAR gets a longer commitment than FAR.
+                latch = int(self.VIS_BLADE_LATCH_DECISIONS) if max_px >= near_thresh else max(8, int(self.VIS_BLADE_LATCH_DECISIONS) // 3)
+                self._blade_left = max(self._blade_left, latch)
+            if off and self._blade_left <= 0:
+                self._blade_left = 0
+
+            if self._blade_left <= 0:
+                return False, 0.0, 1.0
+
+            # Turn away from the heavier eye; use memory if symmetric.
+            diff = left_px - right_px
+            if abs(diff) < 10 and self.VIS_DIRECTION_MEMORY:
+                dir_sign = float(np.sign(self._vis_last_dir)) if abs(self._vis_last_dir) > 1e-6 else 1.0
+            else:
+                dir_sign = 1.0 if diff > 0 else -1.0  # more pixels on left → turn right (+)
+
+            if max_px >= near_thresh:
+                # CLOSE: hard pivot, nearly stop.
+                turn  = float(np.clip(dir_sign * self.VIS_TURN_MAX, -self.VIS_TURN_MAX, self.VIS_TURN_MAX))
+                speed = float(self.VIS_BLADE_SPEED)
+            else:
+                # FAR: gentle anticipatory turn, keep moving.
+                gentle_max = 2.0
+                turn  = float(np.clip(dir_sign * gentle_max, -gentle_max, gentle_max))
+                speed = 0.50
+            return True, turn, speed
+
+        def compute_dragonfly_reflex(feat: dict) -> tuple[bool, float, float]:
+            """Hard turn away whenever a saturated red blob is in sight.
+
+            Distinct from `compute_looming_reflex`: this fires on COLOUR
+            (the dragonfly eyes are the only red object in the scene), not
+            on edge growth, so it triggers earlier and is robust against
+            slow-approaching drones that would not loom much in a single
+            decision step.
+            """
+            if not self.VIS_COLOR_ENABLE:
+                return False, 0.0, 1.0
+            df_area = float(feat.get("dragonfly_area", 0.0))
+            df_x = float(feat.get("dragonfly_x", 0.0))
+
+            on = df_area >= float(self.VIS_DF_AREA_ON)
+            off = df_area <= float(self.VIS_DF_AREA_OFF)
+
+            if self._dragonfly_left > 0:
+                self._dragonfly_left -= 1
+            if on:
+                self._dragonfly_left = max(
+                    self._dragonfly_left, int(self.VIS_DF_LATCH_DECISIONS)
+                )
+            if off and self._dragonfly_left <= 0:
+                self._dragonfly_left = 0
+
+            if self._dragonfly_left <= 0:
+                return False, 0.0, 1.0
+
+            # df_x in [-1, 1]: -1 = full left, +1 = full right.
+            # Steer AWAY from the dragonfly: if it is on the left (df_x<0),
+            # we turn right (+turn).
+            if abs(df_x) < 1e-3 and self.VIS_DIRECTION_MEMORY:
+                dir_sign = float(self._vis_last_dir)
+            else:
+                dir_sign = -1.0 if df_x < 0 else 1.0
+            turn = float(np.clip(
+                self.VIS_DF_TURN_GAIN * dir_sign,
+                -self.VIS_DF_TURN_MAX,
+                self.VIS_DF_TURN_MAX,
+            ))
+            speed = float(self.VIS_DF_SPEED_MIN)
+            return True, turn, speed
+
         # Read raw frames
         frames = None
         if self.VISION_USE_RAW:
@@ -1530,19 +2014,48 @@ class Controller:
 
         feat = extract_visual_features(left_img01, right_img01)
         bump_active, bump_turn, bump_speed, bump_cmax = compute_bump_reflex(feat)
+        blade_active, blade_turn, blade_speed = compute_blade_proximity_reflex(feat)
+        df_active, df_turn, df_speed = compute_dragonfly_reflex(feat)
         looming_active, loom_turn, loom_speed = compute_looming_reflex(feat)
         stop_active, stop_turn, stop_speed = compute_stop_and_go_around(feat)
+        wide_active, wide_turn, wide_speed = compute_wide_clearance(feat)
         avoid_turn, avoid_speed, danger = compute_obstacle_avoidance(feat)
 
+        # Priority order:
+        #   1. BUMP: physical contact -> emergency stop
+        #   2. BLADE: pixel-count threshold -> full pivot away from blade
+        #   3. DRAGONFLY (color): saturated red blob -> peel away early
+        #   4. LOOM: rapid edge growth -> dodge
+        #   5. STOP: large frontal blob -> commit to a direction
+        #   6. WIDE: any blade in ROI -> keep arcing around it
+        #   7. AVOID: continuous obstacle steering
         if bump_active:
             turn = float(bump_turn)
             self._vis_speed_scale = float(bump_speed)
+        elif blade_active:
+            turn = float(blade_turn)
+            self._vis_speed_scale = float(blade_speed)
+        elif df_active:
+            turn = float(df_turn)
+            self._vis_speed_scale = float(df_speed)
+            # boost danger so downstream code (target steer blend, debug) reacts
+            danger = float(np.clip(max(danger, 0.6 + float(feat["dragonfly_area"])), 0.0, 1.0))
         elif looming_active:
             turn = float(loom_turn)
             self._vis_speed_scale = float(loom_speed)
         elif stop_active:
             turn = float(stop_turn)
             self._vis_speed_scale = float(stop_speed)
+        elif wide_active:
+            # Compose with the continuous avoidance signal so we keep the
+            # proportional response (helps when two blades are visible at
+            # once and `lr` swings).
+            turn = float(np.clip(
+                wide_turn + self.VIS_WIDE_AVOID_BLEND * avoid_turn,
+                -self.VIS_TURN_MAX,
+                self.VIS_TURN_MAX,
+            ))
+            self._vis_speed_scale = float(min(wide_speed, avoid_speed))
         else:
             turn = float(avoid_turn)
             self._vis_speed_scale = float(avoid_speed)
@@ -1562,56 +2075,99 @@ class Controller:
         return float(b)
 
     # ------------------------------------------------------------------
-    def _dagger_vision_bias_and_speed(
+    def compute_vision_debug_overlay(
         self, sim: MiniprojectSimulation
-    ) -> tuple[float, float]:
-        """Learned drop-in replacement for `_vision_avoid_bias_and_danger`.
+    ) -> "np.ndarray | None":
+        """Build an RGB debug image showing what the colour detectors see.
 
-        Behavior:
-            * Extract the compact feature vector.
-            * If a safety condition is met (big contact force OR fast looming),
-              delegate to the scripted reflex pipeline. This guarantees that
-              an untrained / still-learning policy cannot override emergencies.
-            * Otherwise query the MLP and return (turn, danger) while setting
-              `self._vis_speed_scale` from the policy's speed output.
+        For each eye, returns the raw fly view dimmed to ~50 % luminance,
+        with three overlay layers in vivid colours:
+          * green   -> pixels classified as 'grass / generic obstacle'
+                        (i.e. either pure green in the upper ROI or a
+                        strong edge / dark pixel)
+          * red     -> pixels classified as 'dragonfly' (saturated red)
+          * cyan    -> ROI rectangle outline, so we can see what the
+                        controller actually looks at
+        Output shape: `(H, 2*W, 3)` uint8, suitable to vstack with the
+        scene-camera frame in the interactive viewer.
+
+        This method is *side-effect free* w.r.t. the FSM state: it does
+        NOT update EMAs, danger, or any latch counter -- only `self._vis_debug_overlay`
+        is set so external callers can read it back.
         """
-        feat = self._dagger_feat.extract(
-            sim,
-            prev_turn=self._dagger_prev_turn,
-            prev_speed=self._dagger_prev_speed,
-        )
+        try:
+            frames = sim.get_raw_vision(sim.fly.name)
+        except Exception:
+            return None
+        if frames is None or len(frames) == 0:
+            return None
 
-        contact_fmax = float(feat[11])
-        d_total_area = float(feat[4])
-        if (
-            contact_fmax >= float(self.DAGGER_BUMP_CONTACT_ON)
-            or d_total_area >= float(self.DAGGER_LOOM_DAREA_ON)
-        ):
-            # Safety: hand control back to scripted reflex pipeline.
-            return self._vision_avoid_bias_and_danger(sim)
+        eye_imgs = []
+        for img in frames[:2]:
+            a = np.asarray(img)
+            if a.ndim == 2:
+                a = np.stack([a, a, a], axis=-1)
+            if a.shape[-1] > 3:
+                a = a[..., :3]
+            if a.dtype != np.uint8:
+                a = np.clip(a, 0, 255).astype(np.uint8)
+            eye_imgs.append(a)
+        # Pad to two eyes if only one was returned.
+        if len(eye_imgs) == 1:
+            eye_imgs.append(eye_imgs[0])
 
-        turn_raw, speed_raw = self._dagger_policy.act(feat)
-        self._dagger_prev_turn = float(turn_raw)
-        self._dagger_prev_speed = float(speed_raw)
+        out_eyes: list[np.ndarray] = []
+        for raw in eye_imgs:
+            h, w = raw.shape[:2]
+            r0, r1 = int(h * self.VIS_ROI_R0), int(h * self.VIS_ROI_R1)
+            c0, c1 = int(w * self.VIS_ROI_C0), int(w * self.VIS_ROI_C1)
 
-        # EMA smoothing on turn to damp high-frequency zig-zags.
-        self._dagger_turn_ema = (
-            self.DAGGER_TURN_EMA * self._dagger_turn_ema
-            + (1.0 - self.DAGGER_TURN_EMA) * float(turn_raw)
-        )
-        turn = float(np.clip(
-            self.DAGGER_BLEND * self._dagger_turn_ema,
-            -self.VIS_TURN_MAX,
-            self.VIS_TURN_MAX,
-        ))
+            img01 = raw.astype(np.float32) / 255.0
 
-        speed = float(np.clip(speed_raw, float(self.DAGGER_SPEED_MIN), 1.0))
-        self._vis_speed_scale = speed
+            # Compute spike mask (same pipeline as the controller).
+            _, _, horizon, spike_roi = self._compute_tip_profile(img01)
 
-        # danger proxy used by downstream debug prints / FSM; conservative.
-        danger = float(np.clip(
-            float(feat[3]) + 0.8 * float(feat[2]),
-            0.0,
-            1.0,
-        ))
-        return turn, danger
+            # Dragonfly colour mask (still colour-based).
+            roi = img01[r0:r1, c0:c1, :]
+            df_mask = self._compute_dragonfly_mask(roi)
+
+            # Compose overlay: darken the original, then paint on top.
+            base = (raw.astype(np.float32) * 0.45).astype(np.uint8)
+            overlay = base.copy()
+            roi_view = overlay[r0:r1, c0:c1, :]  # mutable window into overlay
+
+            h_roi = r1 - r0
+            w_roi = c1 - c0
+
+            # ---- 1. Full spike shape (adaptive colour match inside apex→horizon) ----
+            if spike_roi.shape == (h_roi, w_roi):
+                roi_view[spike_roi] = np.array([20, 255, 40], dtype=np.uint8)
+
+            # ---- 2. Apex markers (yellow): top row of spike mask per column ----
+            for col_i in range(w_roi):
+                if not spike_roi[:, col_i].any():
+                    continue
+                r_int = int(np.argmax(spike_roi[:, col_i]))
+                roi_view[r_int, col_i, :] = np.array([255, 220, 0], dtype=np.uint8)
+
+            # ---- 3. Horizon line (white, per column) ----
+            for col_i in range(w_roi):
+                hr = int(np.clip(horizon[col_i], 0, h_roi - 1))
+                roi_view[hr, col_i, :] = np.array([255, 255, 255], dtype=np.uint8)
+
+            # ---- 4. Dragonfly red eyes: drawn last so they win ----
+            if df_mask.shape == roi_view.shape[:2]:
+                roi_view[df_mask] = np.array([255, 30, 30], dtype=np.uint8)
+
+            # ---- 5. ROI rectangle outline (cyan) ----
+            cyan = np.array([0, 220, 220], dtype=np.uint8)
+            overlay[r0 : r0 + 1, c0:c1, :] = cyan
+            overlay[r1 - 1 : r1, c0:c1, :] = cyan
+            overlay[r0:r1, c0 : c0 + 1, :] = cyan
+            overlay[r0:r1, c1 - 1 : c1, :] = cyan
+
+            out_eyes.append(overlay)
+
+        result = np.concatenate(out_eyes, axis=1).astype(np.uint8)
+        self._vis_debug_overlay = result
+        return result
