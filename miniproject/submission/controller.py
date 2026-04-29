@@ -207,15 +207,22 @@ class Controller:
     VIS_STOP_LATCH_DECISIONS = 30
     VIS_STOP_TURN_BOOST = 6.0   # clipped to VIS_TURN_MAX → always full-authority turn
 
-    # --- Grass-spike detection pipeline ----------------------------------
-    # Stages inside the ROI:
-    #   1. GREEN MASK — chroma `(g−r), (g−b), g_min` → terrain + herbe.
-    #   2. HORIZON — `first_green[col]` lissé par un percentile élevé → sol.
-    #   3. COULEUR DE RÉFÉRENCE — médiane RGB sur les pixels verts **au-dessus**
-    #      de la ligne d’horizon uniquement (ce qui dépasse le sol).
-    #   4. MATCH ADAPTATIF — pixels verts proches de cette référence (L∞ ≤ tol).
-    #   5. TRIANGLE — pour chaque colonne où le pic dépasse nettement le sol,
-    #      bande verticale `first_green … horizon` ∩ match couleur → pic entier.
+    # --- Grass-spike detection (sky–blade–sky horizontal sandwiches) -------
+    # On each IMAGE ROW inside the ROI we segment the line into SKY vs NOT SKY.
+    # Any contiguous NOT-SKY run whose immediate left AND right neighbours are
+    # SKY is a candidate protrusion (blade silhouette against sky).  We keep
+    # only pixels that pass the GREEN grass chroma test inside those runs —
+    # that marks the full horizontal extent of the spike at each altitude.
+    #
+    # SKY mask (mutually exclusive with grass): dark pixels OR blue-tinted sky,
+    # excluding saturated grass chroma (terrain + blades use _compute_green_mask).
+    #
+    # Horizon curve below is still derived from `first_green` for debug overlay.
+    VIS_SKY_LUM_MAX = 0.42
+    # When the pixel is clearly blue-dominant we allow slightly brighter sky.
+    VIS_SKY_LUM_LOOSE = 0.58
+    VIS_SKY_BLUE_MARGIN = 0.02
+
     VIS_TIP_MIN_HEIGHT = 4
     # Half-width (cols) of the horizon-smoothing window.  Window length is
     # 2*HALF + 1.  Should be wider than any single blade silhouette base.
@@ -228,10 +235,6 @@ class Controller:
     # Apex must beat the local horizon by at least this many pixels to count
     # as a candidate (filters horizon noise / anti-alias stair-stepping).
     VIS_TIP_APEX_MARGIN = 3
-    # Max abs. RGB deviation from the per-frame median reference colour
-    # sampled above the horizon (L∞ norm).  Larger → fuller triangles in
-    # shadow / anti-alias; smaller → stricter match to the protruding tip.
-    VIS_SPIKE_COLOR_TOL = 0.11
 
     # --- Blade proximity reflex (consumes the spike pixel count) ---------
     # The reflex stays unchanged in spirit: two speeds, FAR for gentle
@@ -1435,6 +1438,25 @@ class Controller:
         gmin = float(self.VIS_GRASS_GREEN_MIN)
         return ((g - r) > d) & ((g - b) > d) & (g > gmin)
 
+    def _compute_sky_mask(self, roi_rgb: np.ndarray) -> np.ndarray:
+        """Pixels classified as sky / blue background (not grass).
+
+        Grass uses the saturated chroma gate; sky is everything else that looks
+        dark enough OR blue-enough so we do not confuse terrain green with sky.
+        """
+        if not self.VIS_COLOR_ENABLE:
+            return np.zeros(roi_rgb.shape[:2], dtype=bool)
+        r = roi_rgb[..., 0]
+        g = roi_rgb[..., 1]
+        b = roi_rgb[..., 2]
+        lum = (0.299 * r + 0.587 * g + 0.114 * b).astype(np.float32)
+        grass = self._compute_green_mask(roi_rgb)
+        bm = float(self.VIS_SKY_BLUE_MARGIN)
+        blue_ok = (b + bm >= r) & (b + bm >= g)
+        dark_ok = lum <= float(self.VIS_SKY_LUM_MAX)
+        loose_ok = lum <= float(self.VIS_SKY_LUM_LOOSE)
+        return (~grass) & (dark_ok | (blue_ok & loose_ok))
+
     # Backwards-compatible alias for the few legacy callers that still ask
     # for a "grass mask".  All grass pixels are simply pixels of the green
     # mask: terrain *and* blades.  The downstream code that needed a
@@ -1454,17 +1476,16 @@ class Controller:
         return ((r - g) > d) & ((r - b) > d) & (r > rmin)
 
     # ------------------------------------------------------------------
-    # Grass-spike image processing — built from scratch.
+    # Grass spikes via horizontal SKY — BLADE — SKY sandwiches.
     #
-    # Stages:
-    # ------------------------------------------------------------------
-    # Grass-spike image processing.
+    # `_compute_sky_mask` labels blue sky / dark background; `_compute_green_mask`
+    # labels grass.  Row-wise: each maximal contiguous segment of NON-sky that
+    # sits strictly between sky pixels on the left and right contributes GREEN
+    # pixels only → full blade width at each scan-line.
     #
-    # Output (per eye):
-    #   tips[col]       — nombre de pixels du pic dans la colonne
-    #   apex_rows[col]  — ligne du sommet (premier pixel du masque), ou h_roi
-    #   horizon[col]    — ligne d’horizon (sol) lissée
-    #   spike_full      — masque booléen (h_roi, w_roi) du triangle / pic entier
+    # `horizon[col]` is still the smoothed first-green curve for debug drawing.
+    #
+    # Returns (tips per column, apex row, horizon, spike ROI mask).
     # ------------------------------------------------------------------
     def _compute_tip_profile(
         self, eye_img01: np.ndarray
@@ -1484,21 +1505,19 @@ class Controller:
             np.full(w, float(h), np.float32),
             empty_mask,
         )
-        if h < 2 or w < 1 or not self.VIS_COLOR_ENABLE:
+        if h < 2 or w < 2 or not self.VIS_COLOR_ENABLE:
             return empty
 
-        # --- Stage 1: green mask (terrain + spikes) ---
         green = self._compute_green_mask(roi)
+        sky = self._compute_sky_mask(roi)
         if not green.any():
             return empty
 
-        # --- Stage 2a: per-column topmost-green row ---
         has_green = green.any(axis=0)
         first_green = np.where(
             has_green, np.argmax(green, axis=0).astype(np.float32), float(h)
         )
 
-        # --- Stage 2b: horizon = rolling HIGH percentile of first_green ---
         half = int(max(1, self.VIS_TIP_HORIZON_HALF))
         win = 2 * half + 1
         pct = float(self.VIS_TIP_HORIZON_PERCENTILE)
@@ -1512,36 +1531,22 @@ class Controller:
                 w, float(np.percentile(first_green, pct)), dtype=np.float32
             )
 
-        rr = np.arange(h, dtype=np.float32)[:, None]
-        above_h = rr < horizon[None, :]
-
-        # --- Stage 3: référence couleur = médiane RGB au-dessus du sol ---
-        seed = green & above_h
-        if seed.any():
-            ref_r = float(np.median(roi[..., 0][seed]))
-            ref_g = float(np.median(roi[..., 1][seed]))
-            ref_b = float(np.median(roi[..., 2][seed]))
-        else:
-            ref_r = float(np.median(roi[..., 0][green]))
-            ref_g = float(np.median(roi[..., 1][green]))
-            ref_b = float(np.median(roi[..., 2][green]))
-
-        tol = float(self.VIS_SPIKE_COLOR_TOL)
-        dr = np.abs(roi[..., 0] - ref_r)
-        dg = np.abs(roi[..., 1] - ref_g)
-        db = np.abs(roi[..., 2] - ref_b)
-        color_match = green & (np.maximum(np.maximum(dr, dg), db) <= tol)
-
-        # --- Stage 4: slab verticale par colonne + pic détecté (hauteur > seuil) ---
-        apex_margin = float(self.VIS_TIP_APEX_MARGIN)
-        min_height = float(self.VIS_TIP_MIN_HEIGHT)
-        height_above = horizon - first_green
-        geom_ok = has_green & (height_above >= max(min_height, apex_margin))
-
-        slab = geom_ok[None, :] & (rr >= first_green[None, :]) & (
-            rr <= horizon[None, :]
-        )
-        spike_full = color_match & slab
+        spike_full = np.zeros((h, w), dtype=bool)
+        for r in range(h):
+            rs = sky[r]
+            rg = green[r]
+            c = 0
+            while c < w:
+                while c < w and rs[c]:
+                    c += 1
+                if c >= w:
+                    break
+                s = c
+                while c < w and not rs[c]:
+                    c += 1
+                e = c
+                if s > 0 and rs[s - 1] and e < w and rs[e]:
+                    spike_full[r, s:e] = rg[s:e]
 
         tips = spike_full.sum(axis=0).astype(np.float32)
         apex_rows = np.where(
@@ -1580,8 +1585,8 @@ class Controller:
 
         def extract_visual_features(left_img01: np.ndarray, right_img01: np.ndarray) -> dict:
             # ----------------------------------------------------------------
-            # Spike detection: horizon → median RGB above horizon → adaptive
-            # colour match → full wedge mask per column between apex and horizon.
+            # Spike mask: grass pixels that lie inside horizontal SKY–blade–SKY
+            # segments (same rule as `_compute_tip_profile`).
             left_tips, _l_apex, _l_horizon, l_spike = self._compute_tip_profile(
                 left_img01
             )
@@ -2139,27 +2144,34 @@ class Controller:
             h_roi = r1 - r0
             w_roi = c1 - c0
 
-            # ---- 1. Full spike shape (adaptive colour match inside apex→horizon) ----
+            # ---- 1. Classified sky (blue tint; helps tune VIS_SKY_* thresholds) ----
+            sky_roi = self._compute_sky_mask(roi)
+            tint = np.array([45.0, 88.0, 188.0], dtype=np.float32)
+            roi_view[sky_roi] = (
+                roi_view[sky_roi].astype(np.float32) * 0.52 + tint * 0.48
+            ).astype(np.uint8)
+
+            # ---- 2. Spikes (grass inside sky–blade–sky segments; bright green) ----
             if spike_roi.shape == (h_roi, w_roi):
                 roi_view[spike_roi] = np.array([20, 255, 40], dtype=np.uint8)
 
-            # ---- 2. Apex markers (yellow): top row of spike mask per column ----
+            # ---- 3. Apex markers (yellow): top row of spike mask per column ----
             for col_i in range(w_roi):
                 if not spike_roi[:, col_i].any():
                     continue
                 r_int = int(np.argmax(spike_roi[:, col_i]))
                 roi_view[r_int, col_i, :] = np.array([255, 220, 0], dtype=np.uint8)
 
-            # ---- 3. Horizon line (white, per column) ----
+            # ---- 4. Horizon line (white, per column) ----
             for col_i in range(w_roi):
                 hr = int(np.clip(horizon[col_i], 0, h_roi - 1))
                 roi_view[hr, col_i, :] = np.array([255, 255, 255], dtype=np.uint8)
 
-            # ---- 4. Dragonfly red eyes: drawn last so they win ----
+            # ---- 5. Dragonfly red eyes: drawn last so they win ----
             if df_mask.shape == roi_view.shape[:2]:
                 roi_view[df_mask] = np.array([255, 30, 30], dtype=np.uint8)
 
-            # ---- 5. ROI rectangle outline (cyan) ----
+            # ---- 6. ROI rectangle outline (cyan) ----
             cyan = np.array([0, 220, 220], dtype=np.uint8)
             overlay[r0 : r0 + 1, c0:c1, :] = cyan
             overlay[r1 - 1 : r1, c0:c1, :] = cyan

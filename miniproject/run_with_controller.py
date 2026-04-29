@@ -11,8 +11,8 @@ Typical commands (run from the repo root):
     .\\.venv\\Scripts\\python.exe miniproject/run_with_controller.py \\
         --level 4 --seed 42 --render-fly-vision
 
-    # Same but show vision debug overlay (bright green = spike mask from
-    # horizon + adaptive grass colour, yellow = apex, white = horizon curve,
+    # Same but show vision debug overlay (bright green = spike pixels inside
+    # SKY–blade–SKY segments, yellow = apex row, white = horizon estimate,
     # red = dragonfly, cyan = ROI).
     .\\.venv\\Scripts\\python.exe miniproject/run_with_controller.py \\
         --level 4 --seed 42 --debug-vision
