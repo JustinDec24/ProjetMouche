@@ -1,0 +1,158 @@
+﻿.\.venv\Scripts\python.exe : 
+C:\Users\decju\OneDrive\Bureau\MOUCHE\ProjetMouche\.venv\Lib\site-packages\pygame\pkgdata.py:25: UserWarning: 
+pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources 
+package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+Au caractère C:\Users\decju\AppData\Local\Temp\ps-script-ec26318e-555d-4600-8965-0a839cab17f6.ps1:89 : 63
++ ... NG='utf-8'; .\.venv\Scripts\python.exe miniproject\run_with_controlle ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (C:\Users\decju\... Setuptools<81.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  from pkg_resources import resource_stream, resource_exists
+pygame 2.6.1 (SDL 2.28.4, Python 3.12.0)
+Hello from the pygame community. https://www.pygame.org/contribute.html
+level=2 seed=0 max_steps=10000 display=False fly_vision=False debug_vision=False
+
+[VIS_TRACE feats] spike_half_px L=0 R=0 | lr_avoid=+0.000000 (entr├®es vision uniquement ; d├®cision lat├®rale ÔåÆ ligne VIS_TRACE command)
+[VIS_TRACE feats] raw_area L=0.00000 R=0.00000 total=0.00000 center=0.00000 d_total=+0.00000 df_area=0.00000
+[VIS_TRACE flags] bump=False loom=False dragonfly=False (latches: bump=0 loom=0 df=0)
+[VIS_TRACE drives] mode=ALIGN dir=-1 bearing=-0.481 left=59 aligned=False abort=False drives=(1.200,0.120)
+[VIS_TRACE command] commande: ALIGN pivot vers la banane (elle est ├á DROITE du cap, bearingÔëñ0)
+[dbg d=   0] mode=ALIGN dir=-1 bearing=-0.481 align_left=59 drives=(1.200,0.120)
+
+[VIS_TRACE feats] spike_half_px L=0 R=0 | lr_avoid=+0.000000 (entr├®es vision uniquement ; d├®cision lat├®rale ÔåÆ ligne VIS_TRACE command)
+[VIS_TRACE feats] raw_area L=0.00000 R=0.00000 total=0.00000 center=0.00000 d_total=+0.00000 df_area=0.00000
+[VIS_TRACE flags] bump=False loom=False dragonfly=False (latches: bump=0 loom=0 df=0)
+[VIS_TRACE drives] mode=ALIGN dir=-1 bearing=-0.438 left=58 aligned=False abort=False drives=(1.200,0.120)
+[VIS_TRACE command] commande: ALIGN pivot vers la banane (elle est ├á DROITE du cap, bearingÔëñ0)
+[dbg d=   0] mode=ALIGN dir=-1 bearing=-0.438 align_left=58 drives=(1.200,0.120)
+
+[VIS_TRACE feats] spike_half_px L=0 R=0 | lr_avoid=+0.000000 (entr├®es vision uniquement ; d├®cision lat├®rale ÔåÆ ligne VIS_TRACE command)
+[VIS_TRACE feats] raw_area L=0.00000 R=0.00000 total=0.00000 center=0.00000 d_total=+0.00000 df_area=0.00000
+[VIS_TRACE flags] bump=False loom=False dragonfly=False (latches: bump=0 loom=0 df=0)
+[VIS_TRACE drives] mode=ALIGN dir=-1 bearing=-0.404 left=57 aligned=False abort=False drives=(1.200,0.120)
+[VIS_TRACE command] commande: ALIGN pivot vers la banane (elle est ├á DROITE du cap, bearingÔëñ0)
+
+[VIS_TRACE feats] spike_half_px L=0 R=0 | lr_avoid=+0.000000 (entr├®es vision uniquement ; d├®cision lat├®rale ÔåÆ ligne VIS_TRACE command)
+[VIS_TRACE feats] raw_area L=0.00000 R=0.00000 total=0.00000 center=0.00000 d_total=+0.00000 df_area=0.00000
+[VIS_TRACE flags] bump=False loom=False dragonfly=False (latches: bump=0 loom=0 df=0)
+[VIS_TRACE drives] mode=ALIGN dir=-1 bearing=-0.270 left=56 aligned=False abort=False drives=(1.200,0.120)
+[VIS_TRACE command] commande: ALIGN pivot vers la banane (elle est ├á DROITE du cap, bearingÔëñ0)
+
+[VIS_TRACE feats] spike_half_px L=0 R=0 | lr_avoid=+0.000000 (entr├®es vision uniquement ; d├®cision lat├®rale ÔåÆ ligne VIS_TRACE command)
+[VIS_TRACE feats] raw_area L=0.00000 R=0.00000 total=0.00000 center=0.00000 d_total=+0.00000 df_area=0.00000
+[VIS_TRACE flags] bump=False loom=False dragonfly=False (latches: bump=0 loom=0 df=0)
+[VIS_TRACE drives] mode=GO sub=GO dodge_dir=+0.00 avoid_left=0 bias_total=+0.14913 bias_norm=+0.14803 | diminue drives[1]
+[VIS_TRACE drives] drives=(1.2000,1.1030) base=1.200 target_bias=+0.1491
+[VIS_TRACE command] commande: GO jambe droite plus faible ÔåÆ tourne ├á DROITE
+
+[VIS_TRACE feats] spike_half_px L=0 R=0 | lr_avoid=+0.000000 (entr├®es vision uniquement ; d├®cision lat├®rale ÔåÆ ligne VIS_TRACE command)
+[VIS_TRACE feats] raw_area L=0.00000 R=0.00000 total=0.00000 center=0.00000 d_total=+0.00000 df_area=0.00000
+[VIS_TRACE flags] bump=False loom=False dragonfly=False (latches: bump=0 loom=0 df=0)
+[VIS_TRACE drives] mode=GO sub=GO dodge_dir=+0.00 avoid_left=0 bias_total=+0.01598 bias_norm=+0.01598 | diminue drives[1]
+[VIS_TRACE drives] drives=(1.2000,1.1891) base=1.200 target_bias=+0.0160
+[VIS_TRACE command] commande: GO quasi sym├®trique (pas de pivot lat├®ral net)
+[dbg d=   4] mode=GO    sub=GO    dodge=+0.0 align_done=True dist=29.2163818219453 bearing=-0.016 target_bias=+0.016 bias=+0.016 bias_norm=+0.016 drives=(1.200,1.189)
+
+[VIS_TRACE feats] spike_half_px L=0 R=0 | lr_avoid=+0.000000 (entr├®es vision uniquement ; d├®cision lat├®rale ÔåÆ ligne VIS_TRACE command)
+[VIS_TRACE feats] raw_area L=0.00000 R=0.00000 total=0.00000 center=0.00000 d_total=+0.00000 df_area=0.00000
+[VIS_TRACE flags] bump=False loom=False dragonfly=False (latches: bump=0 loom=0 df=0)
+[VIS_TRACE drives] mode=GO sub=GO dodge_dir=+0.00 avoid_left=0 bias_total=+0.01843 bias_norm=+0.01842 | diminue drives[1]
+[VIS_TRACE drives] drives=(1.2000,1.1868) base=1.200 target_bias=+0.0184
+[VIS_TRACE command] commande: GO quasi sym├®trique (pas de pivot lat├®ral net)
+
+[VIS_TRACE feats] spike_half_px L=0 R=0 | lr_avoid=+0.000000 (entr├®es vision uniquement ; d├®cision lat├®rale ÔåÆ ligne VIS_TRACE command)
+[VIS_TRACE feats] raw_area L=0.00000 R=0.00000 total=0.00000 center=0.00000 d_total=+0.00000 df_area=0.00000
+[VIS_TRACE flags] bump=False loom=False dragonfly=False (latches: bump=0 loom=0 df=0)
+[VIS_TRACE drives] mode=GO sub=GO dodge_dir=+0.00 avoid_left=0 bias_total=+0.07273 bias_norm=+0.07260 | diminue drives[1]
+[VIS_TRACE drives] drives=(1.2000,1.1438) base=1.200 target_bias=+0.0727
+[VIS_TRACE command] commande: GO jambe droite plus faible ÔåÆ tourne ├á DROITE
+
+[VIS_TRACE feats] spike_half_px L=0 R=0 | lr_avoid=+0.000000 (entr├®es vision uniquement ; d├®cision lat├®rale ÔåÆ ligne VIS_TRACE command)
+[VIS_TRACE feats] raw_area L=0.00000 R=0.00000 total=0.00000 center=0.00000 d_total=+0.00000 df_area=0.00000
+[VIS_TRACE flags] bump=False loom=False dragonfly=False (latches: bump=0 loom=0 df=0)
+[VIS_TRACE drives] mode=GO sub=GO dodge_dir=+0.00 avoid_left=0 bias_total=-0.03741 bias_norm=-0.03739 | diminue drives[0]
+[VIS_TRACE drives] drives=(1.1685,1.2000) base=1.200 target_bias=-0.0374
+[VIS_TRACE command] commande: GO jambe gauche plus faible ÔåÆ tourne ├á GAUCHE
+
+[VIS_TRACE feats] spike_half_px L=0 R=0 | lr_avoid=+0.000000 (entr├®es vision uniquement ; d├®cision lat├®rale ÔåÆ ligne VIS_TRACE command)
+[VIS_TRACE feats] raw_area L=0.00000 R=0.00000 total=0.00000 center=0.00000 d_total=+0.00000 df_area=0.00000
+[VIS_TRACE flags] bump=False loom=False dragonfly=False (latches: bump=0 loom=0 df=0)
+[VIS_TRACE drives] mode=GO sub=GO dodge_dir=+0.00 avoid_left=0 bias_total=+0.12024 bias_norm=+0.11966 | diminue drives[1]
+[VIS_TRACE drives] drives=(1.2000,1.0935) base=1.200 target_bias=+0.1202
+[VIS_TRACE command] commande: GO jambe droite plus faible ÔåÆ tourne ├á DROITE
+[dbg d=   8] mode=GO    sub=GO    dodge=+0.0 align_done=True dist=26.99691831058839 bearing=-0.120 target_bias=+0.120 bias=+0.120 bias_norm=+0.120 drives=(1.200,1.094)
+
+[VIS_TRACE feats] spike_half_px L=0 R=0 | lr_avoid=+0.000000 (entr├®es vision uniquement ; d├®cision lat├®rale ÔåÆ ligne VIS_TRACE command)
+[VIS_TRACE feats] raw_area L=0.00000 R=0.00000 total=0.00000 center=0.00000 d_total=+0.00000 df_area=0.00000
+[VIS_TRACE flags] bump=False loom=False dragonfly=False (latches: bump=0 loom=0 df=0)
+[VIS_TRACE drives] mode=GO sub=GO dodge_dir=+0.00 avoid_left=0 bias_total=-0.03241 bias_norm=-0.03240 | diminue drives[0]
+[VIS_TRACE drives] drives=(1.1723,1.2000) base=1.200 target_bias=-0.0250
+[VIS_TRACE command] commande: GO jambe gauche plus faible ÔåÆ tourne ├á GAUCHE
+
+[VIS_TRACE feats] spike_half_px L=138 R=2723 | lr_avoid=-0.010378 (entr├®es vision uniquement ; d├®cision lat├®rale ÔåÆ ligne VIS_TRACE command)
+[VIS_TRACE feats] raw_area L=0.02297 R=0.00000 total=0.00632 center=0.01570 d_total=+0.00190 df_area=0.00000
+[VIS_TRACE flags] bump=False loom=False dragonfly=False (latches: bump=0 loom=0 df=0)
+[VIS_TRACE drives] mode=AVOID sub=PIVOT dodge_dir=-1.00 avoid_left=1 bias_total=-5.02133 bias_norm=-0.99991 | diminue drives[0]
+[VIS_TRACE drives] drives=(0.1200,0.3862) base=0.386 target_bias=+0.0578
+[VIS_TRACE command] commande: AVOID [PIVOT] obstacle ├á DROITE ÔÇö dodge=-1 (biais<0 ÔåÆ r├®duit drives[0] ÔåÆ tourne ├á GAUCHE)
+
+[VIS_TRACE feats] spike_half_px L=1942 R=1298 | lr_avoid=+0.002585 (entr├®es vision uniquement ; d├®cision lat├®rale ÔåÆ ligne VIS_TRACE command)
+[VIS_TRACE feats] raw_area L=0.02602 R=0.00000 total=0.01000 center=0.02484 d_total=+0.00243 df_area=0.00000
+[VIS_TRACE flags] bump=False loom=False dragonfly=False (latches: bump=0 loom=0 df=0)
+[VIS_TRACE drives] mode=AVOID sub=PIVOT dodge_dir=-1.00 avoid_left=2 bias_total=-5.02324 bias_norm=-0.99991 | diminue drives[0]
+[VIS_TRACE drives] drives=(0.1200,0.3713) base=0.371 target_bias=+0.0758
+[VIS_TRACE command] commande: AVOID [PIVOT] obstacle ├á DROITE ÔÇö dodge=-1 (biais<0 ÔåÆ r├®duit drives[0] ÔåÆ tourne ├á GAUCHE)
+
+[VIS_TRACE feats] spike_half_px L=3175 R=632 | lr_avoid=+0.010209 (entr├®es vision uniquement ; d├®cision lat├®rale ÔåÆ ligne VIS_TRACE command)
+[VIS_TRACE feats] raw_area L=0.03057 R=0.00000 total=0.01290 center=0.03207 d_total=+0.00257 df_area=0.00000
+[VIS_TRACE flags] bump=False loom=False dragonfly=False (latches: bump=0 loom=0 df=0)
+[VIS_TRACE drives] mode=AVOID sub=PIVOT dodge_dir=-1.00 avoid_left=3 bias_total=-5.02830 bias_norm=-0.99991 | diminue drives[0]
+[VIS_TRACE drives] drives=(0.1200,0.3624) base=0.362 target_bias=+0.0793
+[VIS_TRACE command] commande: AVOID [PIVOT] obstacle ├á DROITE ÔÇö dodge=-1 (biais<0 ÔåÆ r├®duit drives[0] ÔåÆ tourne ├á GAUCHE)
+[dbg d=  12] mode=AVOID sub=PIVOT dodge=-1.0 align_done=True dist=25.14986990163052 bearing=-0.079 target_bias=+0.079 bias=-5.028 bias_norm=-1.000 drives=(0.120,0.362)
+
+[VIS_TRACE feats] spike_half_px L=3152 R=974 | lr_avoid=+0.008744 (entr├®es vision uniquement ; d├®cision lat├®rale ÔåÆ ligne VIS_TRACE command)
+[VIS_TRACE feats] raw_area L=0.03313 R=0.00000 total=0.01492 center=0.03707 d_total=+0.00241 df_area=0.00000
+[VIS_TRACE flags] bump=False loom=False dragonfly=False (latches: bump=0 loom=0 df=0)
+[VIS_TRACE drives] mode=AVOID sub=PIVOT dodge_dir=-1.00 avoid_left=4 bias_total=-5.03941 bias_norm=-0.99992 | diminue drives[0]
+[VIS_TRACE drives] drives=(0.1200,0.3590) base=0.359 target_bias=+0.1408
+[VIS_TRACE command] commande: AVOID [PIVOT] obstacle ├á DROITE ÔÇö dodge=-1 (biais<0 ÔåÆ r├®duit drives[0] ÔåÆ tourne ├á GAUCHE)
+
+[VIS_TRACE feats] spike_half_px L=4171 R=451 | lr_avoid=+0.014935 (entr├®es vision uniquement ; d├®cision lat├®rale ÔåÆ ligne VIS_TRACE command)
+[VIS_TRACE feats] raw_area L=0.03711 R=0.00000 total=0.01692 center=0.04204 d_total=+0.00228 df_area=0.00000
+[VIS_TRACE flags] bump=False loom=False dragonfly=False (latches: bump=0 loom=0 df=0)
+[VIS_TRACE drives] mode=AVOID sub=PIVOT dodge_dir=-1.00 avoid_left=5 bias_total=-5.03823 bias_norm=-0.99992 | diminue drives[0]
+[VIS_TRACE drives] drives=(0.1200,0.3558) base=0.356 target_bias=+0.1307
+[VIS_TRACE command] commande: AVOID [PIVOT] obstacle ├á DROITE ÔÇö dodge=-1 (biais<0 ÔåÆ r├®duit drives[0] ÔåÆ tourne ├á GAUCHE)
+
+[VIS_TRACE feats] spike_half_px L=4426 R=668 | lr_avoid=+0.015087 (entr├®es vision uniquement ; d├®cision lat├®rale ÔåÆ ligne VIS_TRACE command)
+[VIS_TRACE feats] raw_area L=0.04090 R=0.00000 total=0.01886 center=0.04687 d_total=+0.00218 df_area=0.00000
+[VIS_TRACE flags] bump=False loom=False dragonfly=False (latches: bump=0 loom=0 df=0)
+[VIS_TRACE drives] mode=AVOID sub=PIVOT dodge_dir=-1.00 avoid_left=6 bias_total=-5.04810 bias_norm=-0.99992 | diminue drives[0]
+[VIS_TRACE drives] drives=(0.1200,0.3535) base=0.353 target_bias=+0.1645
+[VIS_TRACE command] commande: AVOID [PIVOT] obstacle ├á DROITE ÔÇö dodge=-1 (biais<0 ÔåÆ r├®duit drives[0] ÔåÆ tourne ├á GAUCHE)
+
+[VIS_TRACE feats] spike_half_px L=4419 R=648 | lr_avoid=+0.015139 (entr├®es vision uniquement ; d├®cision lat├®rale ÔåÆ ligne VIS_TRACE command)
+[VIS_TRACE feats] raw_area L=0.04069 R=0.00000 total=0.01968 center=0.04890 d_total=+0.00177 df_area=0.00000
+[VIS_TRACE flags] bump=False loom=False dragonfly=False (latches: bump=0 loom=0 df=0)
+[VIS_TRACE drives] mode=AVOID sub=PIVOT dodge_dir=-1.00 avoid_left=7 bias_total=-5.05072 bias_norm=-0.99992 | diminue drives[0]
+[VIS_TRACE drives] drives=(0.1200,0.3525) base=0.352 target_bias=+0.1840
+[VIS_TRACE command] commande: AVOID [PIVOT] obstacle ├á DROITE ÔÇö dodge=-1 (biais<0 ÔåÆ r├®duit drives[0] ÔåÆ tourne ├á GAUCHE)
+[dbg d=  16] mode=AVOID sub=PIVOT dodge=-1.0 align_done=True dist=24.65356712830933 bearing=-0.184 target_bias=+0.184 bias=-5.051 bias_norm=-1.000 drives=(0.120,0.352)
+
+[VIS_TRACE feats] spike_half_px L=5063 R=389 | lr_avoid=+0.018765 (entr├®es vision uniquement ; d├®cision lat├®rale ÔåÆ ligne VIS_TRACE command)
+[VIS_TRACE feats] raw_area L=0.04378 R=0.00000 total=0.02089 center=0.05192 d_total=+0.00161 df_area=0.00000
+[VIS_TRACE flags] bump=False loom=False dragonfly=False (latches: bump=0 loom=0 df=0)
+[VIS_TRACE drives] mode=AVOID sub=PIVOT dodge_dir=-1.00 avoid_left=8 bias_total=-5.05328 bias_norm=-0.99992 | diminue drives[0]
+[VIS_TRACE drives] drives=(0.1200,0.3502) base=0.350 target_bias=+0.1825
+[VIS_TRACE command] commande: AVOID [PIVOT] obstacle ├á DROITE ÔÇö dodge=-1 (biais<0 ÔåÆ r├®duit drives[0] ÔåÆ tourne ├á GAUCHE)
+
+[VIS_TRACE feats] spike_half_px L=5036 R=601 | lr_avoid=+0.017805 (entr├®es vision uniquement ; d├®cision lat├®rale ÔåÆ ligne VIS_TRACE command)
+[VIS_TRACE feats] raw_area L=0.04526 R=0.00000 total=0.02185 center=0.05430 d_total=+0.00141 df_area=0.00000
+[VIS_TRACE flags] bump=False loom=False dragonfly=False (latches: bump=0 loom=0 df=0)
+[VIS_TRACE drives] mode=AVOID sub=PIVOT dodge_dir=-1.00 avoid_left=9 bias_total=-5.06252 bias_norm=-0.99992 | diminue drives[0]
+[VIS_TRACE drives] drives=(0.1200,0.3500) base=0.350 target_bias=+0.2245
+[VIS_TRACE command] commande: AVOID [PIVOT] obstacle ├á DROITE ÔÇö dodge=-1 (biais<0 ÔåÆ r├®duit drives[0] ÔåÆ tourne ├á GAUCHE)
+step   10000/10000  elapsed=   9.1s  speed=  1103 steps/s  drives=(0.12,0.35)
+done. total_steps=10000 wall_s=9.1
