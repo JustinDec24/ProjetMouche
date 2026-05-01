@@ -203,12 +203,12 @@ class Controller:
     # banane avec une direction latchée. Sortie quand `|bearing| <= ALIGN_BEARING_OK`,
     # quand un réflexe vision impose d'avorter, ou par timeout.
     ALIGN_INITIAL_ENABLE = True
-    ALIGN_BEARING_OK = 0.35      # ~20 deg — sort plus tôt si terrain pentu
-    ALIGN_MAX_DECISIONS = 25     # ~0.6 s safety cap — ne pas gaspiller sur terrain difficile
+    ALIGN_BEARING_OK = 0.20      # ~20 deg — sort plus tôt si terrain pentu
+    ALIGN_MAX_DECISIONS = 60     # ~0.6 s safety cap — ne pas gaspiller sur terrain difficile
 
     # Après une épisode AVOID suffisamment longue (beaucoup d'étapes), on relance
     # ALIGN avec la banane pour réorienter la locomotion avant GO.
-    ALIGN_AFTER_AVOID_ENABLE = True
+    ALIGN_AFTER_AVOID_ENABLE = False
     ALIGN_AFTER_AVOID_MIN_DECISIONS = 8
     ALIGN_AFTER_AVOID_BEARING_MIN = 0.5  # ~28° : réaligner seulement si cap banane très excentré
 
