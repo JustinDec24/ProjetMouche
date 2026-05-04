@@ -33,9 +33,6 @@ class Controller:
     # --- scheduling ---
     DECISION_INTERVAL_S = 0.025  # 25 ms = 40 decisions/s
 
-    # --- startup leg calibration ---
-    _STARTUP_STEPS = 1200  # physics steps: ~200 grip + 6 legs × 120 steps + marge
-
     # --- olfaction (stop only) ---
     PALP_WEIGHT = 9
     ANTENNA_WEIGHT = 1
@@ -308,13 +305,22 @@ class Controller:
         self._align_left = 0      # safety counter (decisions remaining)
         self._align_saw_obstacle = False  # obstacle détecté devant pendant ALIGN
 
-        # Startup calibration counter.
-        self._startup_left = self._STARTUP_STEPS
-
         try:
             self._banana_xy = np.asarray(sim.world.banana_xy, dtype=float)
         except Exception:
             self._banana_xy = None
+
+        # Lift fly at spawn to free any leg clipped into terrain mesh.
+        try:
+            import mujoco as _mj
+            for _jnt in range(sim.mj_model.njnt):
+                if sim.mj_model.jnt_type[_jnt] == _mj.mjtJoint.mjJNT_FREE:
+                    _addr = sim.mj_model.jnt_qposadr[_jnt]
+                    sim.mj_data.qpos[_addr + 2] += 2.0  # +2 mm above terrain
+                    _mj.mj_forward(sim.mj_model, sim.mj_data)
+                    break
+        except Exception:
+            pass
 
         # Precompute row mapping for hex->rect conversion (week4 exercise pattern).
         try:
@@ -345,20 +351,6 @@ class Controller:
         self._step_count += 1
 
         joint_angles, adhesion = self.turning_controller.step(self._drives)
-
-        # --- Startup leg calibration: grip all legs then lift each once ---
-        if self._startup_left > 0:
-            self._startup_left -= 1
-            steps_done = self._STARTUP_STEPS - self._startup_left
-            adhesion = np.ones_like(adhesion)
-            if steps_done > 200:                        # après phase grip initiale
-                n_legs = len(adhesion)
-                leg_step = steps_done - 200            # 1..1000
-                leg_idx = (leg_step - 1) // 120       # patte 0..5
-                in_leg  = (leg_step - 1) % 120        # 0..119
-                if leg_idx < n_legs and in_leg < 50:  # levée 50 steps, grip 70
-                    adhesion[leg_idx] = 0.0
-            return joint_angles, np.clip(adhesion, 0.0, 1.0)
 
         # --- Active roll compensation (every level) ---
         if self.TILT_LEAN_ENABLE:
@@ -393,32 +385,11 @@ class Controller:
                     joint_angles[base + 3] += offset
                     joint_angles[base + 5] += 0.5 * offset
 
-        # Reset request: apply at decision cadence, independent of grip logic.
+        # Reset request: now treated as level failure (stop outputs).
         if is_decision_step and self._request_reset:
-            try:
-                sim.reset()
-            except Exception:
-                pass
             self._request_reset = False
-            self._flip_decisions = 0
-            self._tilt_decisions = 0
-            self._stopped = False
-            self._escape_decisions_left = 0
-            self._stuck_decisions = 0
-            self._last_xy = None
-            self._bump_left = 0
-            self._jam_left = 0
-            self._loom_left = 0
-            self._dragonfly_left = 0
-            self._avoid_left = 0
-            self._avoid_min_left = 0
-            self._avoid_clear = 0
-            self._dodge_dir = 0.0
-            self._avoid_session_ticks = 0
-            self._align_done = False
-            self._align_dir = 0.0
-            self._align_left = 0
-            return joint_angles, adhesion
+            self._stopped = True
+            return np.zeros_like(joint_angles), np.zeros_like(adhesion)
 
         # --- Orientation safety (terrain levels) ---
         if self._enable_terrain and is_decision_step:
@@ -433,8 +404,9 @@ class Controller:
                 self._tilt_decisions = 0
 
             if self._tilt_decisions >= int(self.TERRAIN_TILT_RESET_HOLD):
-                self._request_reset = True
+                self._stopped = True
                 self._tilt_decisions = 0
+                return np.zeros_like(joint_angles), np.zeros_like(adhesion)
 
         # --- Grip control (terrain only) ---
         if self._enable_terrain and is_decision_step:
@@ -450,29 +422,8 @@ class Controller:
                 self._flip_decisions = 0
 
             if self._flip_decisions >= int(self.TERRAIN_FLIP_RESET_HOLD):
-                try:
-                    sim.reset()
-                except Exception:
-                    pass
-                self._flip_decisions = 0
-                self._tilt_decisions = 0
-                self._stopped = False
-                self._escape_decisions_left = 0
-                self._stuck_decisions = 0
-                self._last_xy = None
-                self._bump_left = 0
-                self._jam_left = 0
-                self._loom_left = 0
-                self._dragonfly_left = 0
-                self._avoid_left = 0
-                self._avoid_min_left = 0
-                self._avoid_clear = 0
-                self._dodge_dir = 0.0
-                self._avoid_session_ticks = 0
-                self._align_done = False
-                self._align_dir = 0.0
-                self._align_left = 0
-                return joint_angles, adhesion
+                self._stopped = True
+                return np.zeros_like(joint_angles), np.zeros_like(adhesion)
 
             grip_val = float(self.WIND_GRIP_FORCE) if self._enable_wind else float(self.TERRAIN_GRIP_FORCE)
             try:
