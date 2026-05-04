@@ -34,7 +34,7 @@ class Controller:
     DECISION_INTERVAL_S = 0.025  # 25 ms = 40 decisions/s
 
     # --- startup leg calibration ---
-    _STARTUP_STEPS = 1200  # ~200 grip + 6 legs × 120 steps + marge
+    _STARTUP_STEPS = 1200  # physics steps: ~200 grip + 6 legs × 120 steps + marge
 
     # --- olfaction (stop only) ---
     PALP_WEIGHT = 9
@@ -47,8 +47,8 @@ class Controller:
     STOP_DIST = 2.0
 
     # --- drives ---
-    BASE_DRIVE_FAST = 3.00
-    MAX_DRIVE = 3.50
+    BASE_DRIVE_FAST = 2.40
+    MAX_DRIVE = 2.80
     MAX_DRIVE_TERRAIN = 2.00
     MIN_DRIVE = 0.80
     MIN_DRIVE_TERRAIN = 0.60
@@ -90,8 +90,14 @@ class Controller:
     TILT_LEAN_SIGN = +1.0
 
     # --- grip boost ---
-    TERRAIN_GRIP_FORCE = 2.0  # adhesion pour pattes au sol sur terrain (sans vent)
-    WIND_GRIP_FORCE = 4.0     # adhesion > 1 pour pattes au sol lors de vent
+    TERRAIN_GRIP_FORCE = 2.85  # plus d'adhérence sur collines (évite basculements → reset)
+    WIND_GRIP_FORCE = 10.0    # adhesion > 1 pour pattes au sol lors de vent
+
+    # --- orientation safety (Level 1+): resets renvoient la mouche au spawn — trop agressif = échecs L2 ---
+    TERRAIN_UPRIGHT_TILT_WARN = 0.48  # sous ce seuil on accumule des ticks « très penché »
+    TERRAIN_TILT_RESET_HOLD = 26  # nb de décisions consécutives avant request_reset (était 12 @ 0.55)
+    TERRAIN_FLIP_WEAK_UPRIGHT = 0.12  # en dessous: fly vraiment couchée (était 0.2, trop sensible)
+    TERRAIN_FLIP_RESET_HOLD = 34  # décisions consécutives avant sim.reset() flip (était 18)
 
     # --- vision (Level 2+) ---
     VISION_ENABLE = True
@@ -102,13 +108,13 @@ class Controller:
     VIS_ROI_R0 = 0.05
     VIS_ROI_R1 = 0.78
     # ROI horizontal : même couloir convergent nasal, mais plus large (temporal).
-    VIS_ROI_C0_LEFT = 0.10
-    VIS_ROI_C1_LEFT = 1.00
-    VIS_ROI_C0_RIGHT = 0.00
-    VIS_ROI_C1_RIGHT = 0.90
+    VIS_ROI_C0_LEFT = 0.40
+    VIS_ROI_C1_LEFT = 0.99
+    VIS_ROI_C0_RIGHT = 0.01
+    VIS_ROI_C1_RIGHT = 0.60
     # Bande « centre avant » dans chaque ROI (fractions [0,1]).
-    VIS_CENTER_C0 = 0.20
-    VIS_CENTER_C1 = 0.80
+    VIS_CENTER_C0 = 0.30
+    VIS_CENTER_C1 = 0.70
 
     # Colour perception.
     VIS_COLOR_ENABLE = True
@@ -139,12 +145,12 @@ class Controller:
     VIS_CLOUD_LUM_MAX = 1.0
     VIS_CLOUD_RGB_SPREAD_MAX = 0.14
 
-    VIS_SPIKE_MIN_AREA_PX = 3250  # ignore CC blobs smaller than this (≤0 = off)
+    VIS_SPIKE_MIN_AREA_PX = 1600  # ignore CC blobs smaller than this (≤0 = off)
     # Filtre de forme par blob : un vrai pic est haut+étroit, alors que les
     # silhouettes d'arbres lointains au-dessus de l'horizon sont courtes+étalées.
     # Un blob doit satisfaire les trois critères (aire, hauteur bbox, aspect H/W).
     VIS_SPIKE_MIN_HEIGHT_PX = 40  # hauteur minimale (en pixels) du bbox du blob
-    VIS_SPIKE_MIN_ASPECT = 1     # ratio min hauteur/largeur du bbox (≤0 = off)
+    VIS_SPIKE_MIN_ASPECT = 1.2   # ratio min hauteur/largeur du bbox (≤0 = off)
 
     # Looming reflex (priority).
     LOOM_ENABLE = True
@@ -182,38 +188,38 @@ class Controller:
     # Trigger OFF : center ET total redescendus, pendant N décisions.
     AVOID_CENTER_OFF = 0.003
     AVOID_TOTAL_OFF = 0.003
-    AVOID_CLEAR_DECISIONS = 4
+    AVOID_CLEAR_DECISIONS = 1
     AVOID_MIN_DURATION = 4
     # Hystérésis pour rafraîchir dodge_dir pendant l'AVOID (vision live, pas latch figé).
     # |lr_avoid| courant ≥ ce seuil pour ré-écrire dodge_dir si le signe diffère du latch.
     AVOID_LR_REFRESH = 0.003
 
-    # Turn adaptatif quadratique : fort si obstacle centré, faible si excentré.
-    # bias = AVOID_MAX_TURN * centrality² * dodge + (1 - centrality²) * target_bias
-    AVOID_MAX_TURN  = 1   # turn max quand obstacle parfaitement centré
-    AVOID_MIN_SPEED = 0.55  # vitesse min quand obstacle centré (frontal)
-    AVOID_MAX_SPEED = 0.97  # vitesse max quand obstacle excentré
+    # Sous-mode PIVOT vs ARC : seuil très haut = PIVOT réservé aux obstacles frontaux proches.
+    AVOID_PIVOT_CENTER = 0.050
 
-    # Modulation de vitesse en GO selon densité d'obstacles dans la vision.
-    # Réduction max = GO_SPEED_MAX_REDUCTION × (total_area / AVOID_TOTAL_ON).
-    GO_SPEED_MAX_REDUCTION = 0.08  # 8 % de réduction max en GO quand vision chargée
+    AVOID_PIVOT_TURN = 2.8
+    # > MIN_DRIVE_TERRAIN/BASE pour garder une base réelle > plancher (couple pivot).
+    AVOID_PIVOT_SPEED = 0.80
+    AVOID_ARC_TURN = 0.5
+    AVOID_ARC_SPEED = 0.97
+    # Blend partiel vers la banane pendant ARC pour éviter les spirales.
+    AVOID_ARC_TARGET_BLEND = 0.25
 
     # --- Initial alignment (pivot in place towards banana once) ---
     # Au tout début (et après chaque reset), la mouche pivote sur place vers la
     # banane avec une direction latchée. Sortie quand `|bearing| <= ALIGN_BEARING_OK`,
     # quand un réflexe vision impose d'avorter, ou par timeout.
     ALIGN_INITIAL_ENABLE = True
-    ALIGN_BEARING_OK = 0.20      # ~20 deg — sort plus tôt si terrain pentu
-    ALIGN_MAX_DECISIONS = 60     # ~0.6 s safety cap — ne pas gaspiller sur terrain difficile
+    ALIGN_BEARING_OK = 0.20      # ~11.5 deg
+    ALIGN_MAX_DECISIONS = 60     # ~3 s safety cap
 
     # Après une épisode AVOID suffisamment longue (beaucoup d'étapes), on relance
     # ALIGN avec la banane pour réorienter la locomotion avant GO.
     ALIGN_AFTER_AVOID_ENABLE = False
-    ALIGN_AFTER_AVOID_MIN_DECISIONS = 8
-    ALIGN_AFTER_AVOID_BEARING_MIN = 0.5  # ~28° : réaligner seulement si cap banane très excentré
+    ALIGN_AFTER_AVOID_MIN_DECISIONS = 16   # réaligner seulement après un évitement assez long.
 
     # --- debugging ---
-    DEBUG = True
+    DEBUG = False
     DEBUG_EVERY_DECISIONS = 4
     DEBUG_MAX_DECISIONS = 260
     # Prints détaillés vision / drives (True ou env CONTROLLER_VIS_TRACE=1).
@@ -300,6 +306,7 @@ class Controller:
         self._align_done = False
         self._align_dir = 0.0     # +1.0 = pivot LEFT, -1.0 = pivot RIGHT
         self._align_left = 0      # safety counter (decisions remaining)
+        self._align_saw_obstacle = False  # obstacle détecté devant pendant ALIGN
 
         # Startup calibration counter.
         self._startup_left = self._STARTUP_STEPS
@@ -344,12 +351,12 @@ class Controller:
             self._startup_left -= 1
             steps_done = self._STARTUP_STEPS - self._startup_left
             adhesion = np.ones_like(adhesion)
-            if steps_done > 200:
+            if steps_done > 200:                        # après phase grip initiale
                 n_legs = len(adhesion)
-                leg_step = steps_done - 200
-                leg_idx = (leg_step - 1) // 120
-                in_leg  = (leg_step - 1) % 120
-                if leg_idx < n_legs and in_leg < 50:
+                leg_step = steps_done - 200            # 1..1000
+                leg_idx = (leg_step - 1) // 120       # patte 0..5
+                in_leg  = (leg_step - 1) % 120        # 0..119
+                if leg_idx < n_legs and in_leg < 50:  # levée 50 steps, grip 70
                     adhesion[leg_idx] = 0.0
             return joint_angles, np.clip(adhesion, 0.0, 1.0)
 
@@ -411,7 +418,6 @@ class Controller:
             self._align_done = False
             self._align_dir = 0.0
             self._align_left = 0
-            self._startup_left = self._STARTUP_STEPS
             return joint_angles, adhesion
 
         # --- Orientation safety (terrain levels) ---
@@ -421,12 +427,12 @@ class Controller:
             except Exception:
                 uprightness = 1.0
 
-            if uprightness < 0.55:
+            if uprightness < float(self.TERRAIN_UPRIGHT_TILT_WARN):
                 self._tilt_decisions += 1
             else:
                 self._tilt_decisions = 0
 
-            if self._tilt_decisions >= 12:
+            if self._tilt_decisions >= int(self.TERRAIN_TILT_RESET_HOLD):
                 self._request_reset = True
                 self._tilt_decisions = 0
 
@@ -438,21 +444,34 @@ class Controller:
 
             if uprightness < -0.4:
                 self._flip_decisions = 999
-            elif uprightness < 0.2:
+            elif uprightness < float(self.TERRAIN_FLIP_WEAK_UPRIGHT):
                 self._flip_decisions += 1
             else:
                 self._flip_decisions = 0
 
-            if self._flip_decisions >= 18:
+            if self._flip_decisions >= int(self.TERRAIN_FLIP_RESET_HOLD):
                 try:
                     sim.reset()
                 except Exception:
                     pass
                 self._flip_decisions = 0
+                self._tilt_decisions = 0
                 self._stopped = False
                 self._escape_decisions_left = 0
                 self._stuck_decisions = 0
                 self._last_xy = None
+                self._bump_left = 0
+                self._jam_left = 0
+                self._loom_left = 0
+                self._dragonfly_left = 0
+                self._avoid_left = 0
+                self._avoid_min_left = 0
+                self._avoid_clear = 0
+                self._dodge_dir = 0.0
+                self._avoid_session_ticks = 0
+                self._align_done = False
+                self._align_dir = 0.0
+                self._align_left = 0
                 return joint_angles, adhesion
 
             grip_val = float(self.WIND_GRIP_FORCE) if self._enable_wind else float(self.TERRAIN_GRIP_FORCE)
@@ -463,7 +482,8 @@ class Controller:
                 adhesion = np.zeros_like(adhesion)
                 n = min(len(adhesion), len(stance))
                 if self._enable_wind:
-                    adhesion[:n] = grip_val  # toutes les pattes pendant le vent
+                    # Toutes les pattes reçoivent le grip max pendant le vent.
+                    adhesion[:n] = grip_val
                 else:
                     adhesion[:n] = stance[:n].astype(float) * grip_val
             except Exception:
@@ -563,12 +583,28 @@ class Controller:
         heading_xy, lateral_xy = self._get_body_frame_xy(sim)
         lateral_err = float(np.dot(lateral_xy, to_target))
         forward_err = float(np.dot(heading_xy, to_target))
+        # Banane derrière et sur le côté : demi-tour court ; actif au-delà de 13 m (évite
+        # la phase finale) — pas de borne haute pour ne pas couper les trajectoires longues.
+        if (
+            self._enable_grass
+            and self._enable_terrain
+            and dist_tt > 13.0
+            and forward_err < -0.03
+            and abs(lateral_err) > 0.28
+        ):
+            s = 1.0 if lateral_err >= 0.0 else -1.0
+            bearing = float(s * (np.pi - 0.42))
+        else:
+            # L2 : petit forward_err>0 → atan2 trop sensible ; plancher sur fe.
+            fe = float(forward_err)
+            if self._enable_grass and self._enable_terrain and dist_tt < 30.0 and fe > 0.04:
+                fe = max(fe, 0.11)
+            bearing = float(np.arctan2(lateral_err, fe))
         g = (
             self.TARGET_STEER_GAIN_CLOSE
             if dist_tt < self.TARGET_STEER_CLOSE_DIST
             else self.TARGET_STEER_GAIN
         )
-        bearing = float(np.arctan2(lateral_err, forward_err))
         bias = -float(self.TARGET_STEER_BIAS_SCALE) * g * bearing
         return bias, bearing
 
@@ -749,17 +785,9 @@ class Controller:
             self._last_vision_turn_bias = float(bias - target_bias)
         else:
             bias = float(target_bias)
+            base_drive = float(self.BASE_DRIVE_FAST)
             sub_mode = "GO"
             self._last_vision_turn_bias = 0.0
-            # Ralentir légèrement si des obstacles sont visibles (5-10%).
-            if feat is not None:
-                density = float(np.clip(
-                    float(feat.get("total_area", 0.0)) / max(float(self.AVOID_TOTAL_ON), 1e-6),
-                    0.0, 1.0,
-                ))
-                base_drive = float(self.BASE_DRIVE_FAST) * (1.0 - float(self.GO_SPEED_MAX_REDUCTION) * density)
-            else:
-                base_drive = float(self.BASE_DRIVE_FAST)
         self._avoid_sub = sub_mode
 
         # ---- Terrain (Level 1) ----
@@ -876,8 +904,7 @@ class Controller:
             or not self.ALIGN_AFTER_AVOID_ENABLE
         ):
             return
-        bearing_off = abs(float(self._last_target_bearing)) >= float(self.ALIGN_AFTER_AVOID_BEARING_MIN)
-        if ticks >= int(self.ALIGN_AFTER_AVOID_MIN_DECISIONS) and bearing_off:
+        if ticks >= int(self.ALIGN_AFTER_AVOID_MIN_DECISIONS):
             self._align_done = False
             self._align_dir = 0.0
             self._align_left = 0
@@ -981,31 +1008,19 @@ class Controller:
     def _avoid_command(
         self, target_bias: float, feat: dict | None, vis: _VisFlags
     ) -> tuple[float, float, str]:
-        """Turn adaptatif quadratique selon la centralité de l'obstacle.
-
-        centrality = center_area / total_area  ∈ [0, 1]
-          0 (excentré) → esquive ≈ 0, banane domine → la mouche continue vers la banane
-          1 (centré)   → esquive = AVOID_MAX_TURN, banane écrasée → pivot fort
-        Modèle quadratique : l'esquive explose seulement si l'obstacle est vraiment frontal.
-        """
+        """Renvoie (bias, base_drive, sub_mode) — PIVOT (frontal) ou ARC (latéral)."""
         center_area = float(feat.get("center_area", 0.0)) if feat is not None else 0.0
-        total_area  = float(feat.get("total_area",  0.0)) if feat is not None else 0.0
         dodge = self._dodge_dir if abs(self._dodge_dir) > 1e-6 else 1.0
+        pivot = center_area >= float(self.AVOID_PIVOT_CENTER) or bool(vis.bump)
         max_turn = float(self.VIS_TURN_MAX)
-
-        if bool(vis.bump):
-            bias = float(np.clip(float(self.AVOID_MAX_TURN) * dodge, -max_turn, max_turn))
-            return bias, float(self.AVOID_MIN_SPEED * self.BASE_DRIVE_FAST), "AVOID"
-
-        centrality = float(np.clip(center_area / max(total_area, 1e-6), 0.0, 1.0))
-        quad = centrality ** 2
-
-        avoid_turn   = float(self.AVOID_MAX_TURN) * quad * dodge
-        banana_blend = (1.0 - quad) * float(target_bias)
-        bias = float(np.clip(avoid_turn + banana_blend, -max_turn, max_turn))
-
-        speed = float(self.AVOID_MAX_SPEED) - (float(self.AVOID_MAX_SPEED) - float(self.AVOID_MIN_SPEED)) * quad
-        return bias, float(speed * self.BASE_DRIVE_FAST), "AVOID"
+        if pivot:
+            bias = float(np.clip(self.AVOID_PIVOT_TURN * dodge, -max_turn, max_turn))
+            base = float(self.AVOID_PIVOT_SPEED * self.BASE_DRIVE_FAST)
+            return bias, base, "PIVOT"
+        bias = self.AVOID_ARC_TURN * dodge + self.AVOID_ARC_TARGET_BLEND * float(target_bias)
+        bias = float(np.clip(bias, -max_turn, max_turn))
+        base = float(self.AVOID_ARC_SPEED * self.BASE_DRIVE_FAST)
+        return bias, base, "ARC"
 
     # ------------------------------------------------------------------
     # Colour masks (kept verbatim — used by both detection and overlay).
