@@ -448,3 +448,7 @@ fabric.properties
 
 *.mp4
 outputs/
+
+# Local debug artifacts
+vision_debug_*/
+.claude/
