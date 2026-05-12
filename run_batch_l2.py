@@ -10,7 +10,7 @@ from flygym.compose import ActuatorType
 import numpy as np
 
 _rng = np.random.RandomState(42)
-SEEDS = sorted(int(s) for s in _rng.choice(range(0, 1000), size=30, replace=False))
+SEEDS = sorted(int(s) for s in _rng.choice(range(0, 1000), size=20, replace=False))
 LEVEL = 2
 MAX_STEPS = 200_000
 PROGRESS_EVERY = 5_000

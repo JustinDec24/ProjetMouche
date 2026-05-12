@@ -11,25 +11,32 @@ _SPIKE_CONN = np.ones((3, 3), dtype=np.int32)
 
 
 class Controller:
-    """Cap banane + vision frontale (panorama bi-oculaire).
+    """UNION : cap banane + vision panorama + FSM AVOID + anti-jam multi-niveau.
 
-    FSM :
-      ALIGN  — pivot sur place vers la banane (au début)
-      GO     — cap banane, pas d'obstacle détecté
-      AVOID  — ARC d'esquive linéaire selon la position de l'obstacle dans le champ
+    Hybride combinant les forces de spike-ciel-sky-border et MERGE pour
+    maximiser le taux de succès sur L2.
 
-    Vision : panorama frontal (œil gauche + œil droit fusionnés). Détection des
-    pics par contraste sky/cloud (un pic = grass entouré horizontalement de
-    sky/cloud). On extrait (obs_size, obs_x) où obs_x ∈ [-1, +1] est la position
-    de l'obstacle dans le repère corps : -1 = extrême gauche, 0 = pile en face,
-    +1 = extrême droite.
+    Priorité dans _compute_drives :
+      1. Stop (dist banane <= STOP_DIST OU odor seuil)
+      2. Terrain stuck/escape (mouche immobilisée par mesh terrain)
+      3. JAM_REFLEX : anti-stuck rapide non-visuel (mouvement = 0)
+      4. SIDESTEP_NOPROG : anti-stuck par PROGRESSION distance (mouvement
+         latéral mais pas de progrès vers banane) — port depuis MERGE
+      5. ALIGN initial (pivot sur place vers banane via bearing géométrique)
+      6. AVOID FSM : arc-dodge si vision détecte pique
+      7. GO normal : cap banane + GO_SWEEP si signal vision ambigu
 
-    Esquive ARC linéaire :
-      centrality = 1 - |obs_x|        (max au centre, 0 sur le bord)
-      dodge_mag  = AVOID_TURN_MAX * centrality
-      dodge_dir  = -sign(obs_x)              si |obs_x| > AVOID_CENTER_EPS
-                 = sign(target_bias_banane)  sinon  (tiebreak côté banane)
-      bias_final = dodge_dir * dodge_mag + AVOID_BANANA_BLEND * target_bias
+    Vision : panorama bi-oculaire (cols nasales de chaque œil concaténées).
+    Détection sky-grass-sky horizontal par ligne + CC filter (height, aspect).
+    Outputs (obs_size, obs_x) ∈ [0, 1] × [-1, +1].
+
+    AVOID arc-dodge :
+      dodge_mag  = AVOID_TURN_MAX × centralité × size_factor × tilt_factor
+      dodge_dir  = -sign(latched_obs_x) avec tiebreak côté banane
+      bias       = dodge × dodge_dir + AVOID_BANANA_BLEND × target_bias
+
+    PAS de head-collision recovery (cause des flips pathologiques sur terrain
+    pentu — voir seed 513 sur MERGE qui finissait à dist=1264 m).
     """
 
     # --- scheduling ---
@@ -100,6 +107,22 @@ class Controller:
     JAM_MIN_DRIVE = 0.70
     JAM_TRIGGER_DECISIONS = 4
     JAM_LATCH_DECISIONS = 14
+
+    # --- SIDESTEP no-progress (anti-jam complémentaire — détecte le stuck
+    # quand la mouche bouge latéralement sans progresser vers la banane).
+    # JAM_REFLEX rate ces cas car il y a du mouvement physique ; SIDESTEP
+    # se base sur la distance à la banane sur une fenêtre temporelle.
+    SIDESTEP_ENABLE = True
+    NOPROG_WINDOW = 30              # ~750 ms de fenêtre d'analyse
+    NOPROG_MIN_DELTA = 0.4          # progression < 0.4 m sur la fenêtre → stuck
+    SIDESTEP_BACKUP_DECISIONS = 5
+    SIDESTEP_TURN_DECISIONS = 14
+    SIDESTEP_BACKUP_DRIVE = -0.6
+    SIDESTEP_DRIVE_FAST = 1.80
+    SIDESTEP_DRIVE_SLOW = 0.30
+    SIDESTEP_DISABLE_CLOSE_DIST = 6.0   # < 6 m banane : on ne sidestep plus
+    ROLL_TRIGGER_THRESH = 0.30
+    ROLL_TRIGGER_HOLD = 3
 
     # --- VISION (Level 2+) ---------------------------------------------------
     # Activée seulement si _enable_grass=True. Détection panoramique
@@ -237,6 +260,13 @@ class Controller:
         # Jam reflex
         self._jam_left = 0
         self._jam_dir = 1
+
+        # SIDESTEP no-progress state
+        self._dist_history: list[float] = []
+        self._sidestep_decisions_left = 0
+        self._sidestep_dir = +1
+        self._sidestep_cooldown = 0
+        self._roll_high_count = 0
 
         # Initial alignment state
         self._align_done = False
@@ -559,6 +589,13 @@ class Controller:
                     return np.array([maxd, mind], dtype=float)
                 return np.array([mind, maxd], dtype=float)
 
+        # ---- SIDESTEP no-progress (anti-jam complémentaire) ----
+        # Détecte le stuck quand la mouche bouge latéralement (donc JAM ne
+        # fire pas) mais ne progresse pas vers la banane. Force backup+pivot.
+        sidestep_drives = self._sidestep_step(sim)
+        if sidestep_drives is not None:
+            return sidestep_drives
+
         # ---- Stop sur banane (olfaction) ----
         odor_lin = sim.get_olfaction(sim.fly.name)
         lp, rp, la, ra = odor_lin[:, 0]
@@ -707,6 +744,112 @@ class Controller:
                 flush=True,
             )
         return drives
+
+    # ------------------------------------------------------------------
+    # SIDESTEP no-progress (anti-jam complémentaire à JAM_REFLEX)
+    # ------------------------------------------------------------------
+    def _sidestep_step(self, sim) -> "np.ndarray | None":
+        """Backup + sidestep si la mouche ne progresse plus vers la banane.
+
+        Détecte deux situations :
+          - distance à banane stagne sur NOPROG_WINDOW décisions
+          - roll dépasse ROLL_TRIGGER_THRESH pendant ROLL_TRIGGER_HOLD ticks
+        Retourne drives ou None si inactif.
+        """
+        if not self.SIDESTEP_ENABLE:
+            return None
+        # Continuation d'un sidestep en cours
+        if self._sidestep_decisions_left > 0:
+            self._sidestep_decisions_left -= 1
+            n_left = self._sidestep_decisions_left
+            if n_left >= int(self.SIDESTEP_TURN_DECISIONS):
+                d = float(self.SIDESTEP_BACKUP_DRIVE)
+                return np.array([d, d])
+            if n_left == 0:
+                self._sidestep_cooldown = int(self.NOPROG_WINDOW)
+                self._dist_history.clear()
+            if self._sidestep_dir > 0:
+                return np.array([self.SIDESTEP_DRIVE_FAST, self.SIDESTEP_DRIVE_SLOW])
+            return np.array([self.SIDESTEP_DRIVE_SLOW, self.SIDESTEP_DRIVE_FAST])
+
+        # Pas de banana → pas de notion de progression
+        if self._last_dist_to_banana is None:
+            return None
+
+        # Désactivé proche de la banane (final sprint)
+        if self._last_dist_to_banana < float(self.SIDESTEP_DISABLE_CLOSE_DIST):
+            self._dist_history.clear()
+            return None
+
+        # Update dist history
+        self._dist_history.append(float(self._last_dist_to_banana))
+        if len(self._dist_history) > int(self.NOPROG_WINDOW):
+            self._dist_history.pop(0)
+
+        # Alarme roll (mouche penche fortement sans tomber)
+        try:
+            xmat_pre = sim.mj_data.xmat[self._thorax_body_id].reshape(3, 3)
+            roll_pre = float(xmat_pre[2, 1])
+            upright_pre = float(xmat_pre[2, 2])
+        except Exception:
+            roll_pre, upright_pre = 0.0, 1.0
+        roll_alarm = (
+            abs(roll_pre) > float(self.ROLL_TRIGGER_THRESH)
+            and upright_pre > float(self.TERRAIN_FLIP_WEAK_UPRIGHT)
+        )
+        if roll_alarm:
+            self._roll_high_count += 1
+        else:
+            self._roll_high_count = 0
+
+        trigger_now = False
+        trigger_prev_diff = 0.0
+
+        if self._roll_high_count >= int(self.ROLL_TRIGGER_HOLD):
+            trigger_now = True
+            trigger_prev_diff = float(self._drives[0]) - float(self._drives[1])
+
+        if self._sidestep_cooldown > 0:
+            self._sidestep_cooldown -= 1
+
+        if (
+            not trigger_now
+            and self._sidestep_cooldown == 0
+            and len(self._dist_history) >= int(self.NOPROG_WINDOW)
+        ):
+            progress = self._dist_history[0] - self._dist_history[-1]
+            if progress < float(self.NOPROG_MIN_DELTA):
+                trigger_now = True
+                trigger_prev_diff = float(self._drives[0]) - float(self._drives[1])
+
+        if not trigger_now:
+            return None
+
+        # Choisit la direction du sidestep selon le dernier diff de drives
+        if trigger_prev_diff > 0.05:
+            self._sidestep_dir = +1
+        elif trigger_prev_diff < -0.05:
+            self._sidestep_dir = -1
+        else:
+            self._sidestep_dir = -self._sidestep_dir or +1
+
+        self._sidestep_decisions_left = (
+            int(self.SIDESTEP_BACKUP_DECISIONS)
+            + int(self.SIDESTEP_TURN_DECISIONS)
+        )
+        self._roll_high_count = 0
+        # Reset autres états pour éviter conflits
+        self._avoid_left = 0
+        self._avoid_clear = 0
+        self._latched_obs_x = 0.0
+        if self.DEBUG:
+            print(
+                f"[SIDESTEP d={self._debug_decisions}] dir={self._sidestep_dir:+d} "
+                f"(roll={roll_pre:+.2f} prog={self._dist_history[0]-self._dist_history[-1]:.2f})",
+                flush=True,
+            )
+        d = float(self.SIDESTEP_BACKUP_DRIVE)
+        return np.array([d, d])
 
     # ------------------------------------------------------------------
     # AVOID FSM
