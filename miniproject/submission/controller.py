@@ -143,8 +143,8 @@ class Controller:
     #   - il est vert
     #   - il existe au moins un pixel ciel à sa gauche dans la même ligne
     #   - et au moins un pixel ciel à sa droite dans la même ligne
-    VIS_GREEN_DELTA = 0.10          # G - R > delta ET G - B > delta
-    VIS_GREEN_MIN = 0.30            # G doit être > 0.30
+    VIS_GREEN_DELTA = 0.12          # G - R > delta ET G - B > delta (vert franc)
+    VIS_GREEN_MIN = 0.32            # G doit être > 0.32
     VIS_SKY_BLUE_MARGIN = 0.03      # B + margin >= R et B + margin >= G
     VIS_SKY_GREY_SPREAD_MAX = 0.18  # max(R,G,B) - min(R,G,B) < spread → achromatique
     VIS_SKY_MIN_SUM = 0.90          # somme RGB > 0.90
@@ -153,17 +153,15 @@ class Controller:
     #     très distants à peine visibles)
     #   - VIS_SPIKE_MIN_ASPECT : ratio h/w minimum → garde les structures
     #     VERTICALES (piques) et rejette les masses larges/horizontales (hills)
-    VIS_SPIKE_MIN_HEIGHT = 5
-    VIS_SPIKE_MIN_ASPECT = 1.2
-    BLADE_COUNT_URGENT = 350        # ~350 px = brin frontal proche bien visible
+    VIS_SPIKE_MIN_HEIGHT = 8        # strict : pique doit être assez haut
+    VIS_SPIKE_MIN_ASPECT = 1.5      # strict : franchement vertical
+    BLADE_COUNT_URGENT = 500
     VIS_EMA = 0.55
     VIS_STARTUP_DELAY_DECISIONS = 8
-    # ROI : portion frontale + au-dessus de l'horizon par œil. On reste assez
-    # haut (0.45) pour que la ligne d'horizon ne tombe pas dans la ROI : sinon
-    # les blobs de brin se mélangent avec la bande horizon et ratent le filtre
-    # aspect ratio.
-    VIS_FRONTAL_FRAC = 0.55
-    VIS_UPPER_FRAC = 0.45
+    # ROI élargie : on regarde plus de champ horizontal (0.70) ET un peu plus
+    # de hauteur (0.55). Le filtre aspect rejette les blobs d'horizon larges.
+    VIS_FRONTAL_FRAC = 0.70
+    VIS_UPPER_FRAC = 0.55
 
     # --- AVOID FSM (déclenchement / sortie) ---
     AVOID_SIZE_ON = 0.45            # entre AVOID (~180 px silhouette)
