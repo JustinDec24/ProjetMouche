@@ -157,13 +157,13 @@ class Controller:
     #     VERTICALES (piques) et rejette les masses larges/horizontales (hills)
     VIS_SPIKE_MIN_HEIGHT = 6        # blob doit s'étendre verticalement
     VIS_SPIKE_MAX_WIDTH = 35        # largeur max ciel-borders (allow close blades)
-    # Bande CENTRALE = ce qui bloque vraiment le chemin
-    VIS_CENTRAL_FRAC = 0.22         # ~22% nasal-most de la ROI par œil
+    # Bande CENTRALE = ce qui bloque vraiment le chemin (= proximité du pique)
+    VIS_CENTRAL_FRAC = 0.30
     VIS_EMA = 0.55
     VIS_STARTUP_DELAY_DECISIONS = 8
-    # ROI : 75% en hauteur, 70% nasal en largeur
-    VIS_FRONTAL_FRAC = 0.70
-    VIS_UPPER_FRAC = 0.75
+    # ROI maximisée : on prend tout le nasal de chaque œil + bonne partie verticale
+    VIS_FRONTAL_FRAC = 1.0          # vision horizontale au MAX
+    VIS_UPPER_FRAC = 0.85
 
     # Champ de répulsion :
     #   bias = target_bias                                  (attraction banane)
@@ -172,24 +172,25 @@ class Controller:
     # La répulsion continue est volontairement faible pour que target_bias
     # domine quand les piques sont peripheriques ou lointains. EMERGENCY
     # n'active que quand un blocker tombe pile dans le central.
-    # Pondération des trois forces qui composent le steering :
-    #   bias = TARGET_GAIN × target_bias  (attraction banane, dominante)
-    #        + REPULSION_GAIN × (-obs_x) × obs_size  (répulsion continue)
-    #        + EMERGENCY_GAIN × dir_latched × central_size  (dodge urgent)
-    # TARGET_GAIN > REPULSION+EMERGENCY → la mouche ne reste pas piégée à
-    # esquiver indéfiniment, elle finit par chercher un chemin vers la banane.
+    # Champ de potentiel pur : la mouche est attirée vers la banane (target)
+    # et repoussée par les piques proportionnellement à leur PROXIMITÉ :
+    #   bias = TARGET_GAIN × target_bias  (attraction banane, toujours présente)
+    #        + REPULSION_GAIN × (-obs_x) × central_size
+    # central_size croît à mesure que la mouche s'approche d'un pique central
+    # → la répulsion augmente naturellement, courbe la trajectoire autour
+    # du pique. Pas de seuil "dodge binaire" : la mouche glisse le long
+    # du bord du champ de répulsion vers la banane.
     TARGET_GAIN = 3.0
-    REPULSION_GAIN = 2.0
-    URGENT_TOTAL = 500              # normalisation pour obs_size (count total)
-    URGENT_CENTRAL = 200            # normalisation pour central_size
-    # Ralentissement quand piques en vue → plus de temps physique pour esquiver
-    VIS_SLOW_GAIN = 0.85
-    VIS_SLOW_MIN = 0.18
-    # Dodge d'urgence (latché) : forte quand un blocker est imminent au centre
-    CENTRAL_TRIGGER = 0.35
-    EMERGENCY_GAIN = 2.5
-    EMERGENCY_LATCH_DECISIONS = 10
-    # Saturation du bias avant tanh (anti-violent-turn)
+    # Répulsion QUADRATIQUE en central_size : faible quand pique loin/peripherique,
+    # GROS quand pique proche/central. La mouche glisse le long du bord du
+    # champ de répulsion vers la banane.
+    REPULSION_GAIN = 8.0
+    URGENT_TOTAL = 500              # normalisation pour obs_size
+    URGENT_CENTRAL = 60             # normalisation pour central_size
+    # Ralentissement léger : vitesse maintenue pour rester réactive
+    VIS_SLOW_GAIN = 0.30
+    VIS_SLOW_MIN = 0.55             # garde au moins 55% de la vitesse
+    # Saturation du bias avant tanh
     VIS_TURN_MAX = 3.0
 
     # --- debug ---
@@ -245,8 +246,6 @@ class Controller:
         self._vis_obs_size = 0.0        # magnitude TOTAL (toutes piques visibles)
         self._vis_obs_x = 0.0
         self._vis_central_size = 0.0    # magnitude CENTRAL (blocker imminent)
-        self._emergency_latch_left = 0
-        self._emergency_dir = +1.0
         self._vis_debug_overlay = None
 
         # SIDESTEP no-progress state
@@ -629,35 +628,22 @@ class Controller:
         if self.VISION_ENABLE and self._enable_grass:
             obs_size, obs_x = self._vision_step(sim)
 
-        # ---- Champ de répulsion ----
-        # obs_size = magnitude total (piques visibles, périphérique compris)
-        # central_size = blocker imminent (déclenche l'emergency dodge)
-        # Répulsion continue d'amplitude obs_size dans direction -obs_x.
-        # target_bias domine quand obs_size est petit (= pas de piques en vue).
+        # ---- Champ de potentiel : attraction banane + répulsion piques ----
+        # Répulsion d'amplitude central_size (= proximité du pique central) :
+        # - pique loin/peripherique → central_size ≈ 0 → repulsion ≈ 0
+        #   → target_bias domine, mouche fonce vers banane
+        # - pique de plus en plus proche → central_size croît → répulsion croît
+        #   → trajectoire se courbe autour du pique, glisse le long du
+        #   "champ de répulsion" tout en restant attirée vers la banane
         central_size = float(self._vis_central_size)
-        repulsion = float(self.REPULSION_GAIN) * (-obs_x) * obs_size
-        emergency_dodge = 0.0
-        if self._emergency_latch_left > 0:
-            self._emergency_latch_left -= 1
-        if central_size > float(self.CENTRAL_TRIGGER):
-            if self._emergency_latch_left <= 0:
-                # Choix de la direction d'esquive (latchée pour éviter flip-flop)
-                if abs(obs_x) < 0.05:
-                    self._emergency_dir = 1.0 if target_bias > 0.0 else -1.0
-                else:
-                    self._emergency_dir = -1.0 if obs_x > 0.0 else 1.0
-                self._emergency_latch_left = int(self.EMERGENCY_LATCH_DECISIONS)
-            emergency_dodge = (
-                float(self.EMERGENCY_GAIN) * float(self._emergency_dir) * central_size
-            )
+        # Quadratique : grandit faiblement à distance, explose à courte portée
+        repulsion = float(self.REPULSION_GAIN) * (-obs_x) * (central_size ** 2)
 
-        # Steering = TARGET × attraction banane + répulsion + emergency dodge.
-        # TARGET_GAIN > 1 garantit que la banane reste influente même quand
-        # la mouche détecte des piques de tous côtés.
-        bias = float(self.TARGET_GAIN) * float(target_bias) + repulsion + emergency_dodge
-        # Ralentissement : plus le pique central est gros, plus on ralentit
-        # pour laisser le temps d'esquiver.
-        slow_factor = 1.0 - float(self.VIS_SLOW_GAIN) * obs_size
+        bias = float(self.TARGET_GAIN) * float(target_bias) + repulsion
+
+        # Ralentissement proportionnel au pique central : plus le blocker est
+        # proche, plus la mouche ralentit pour mieux courber.
+        slow_factor = 1.0 - float(self.VIS_SLOW_GAIN) * central_size
         slow_factor = max(float(self.VIS_SLOW_MIN), slow_factor)
         base_drive = float(self.BASE_DRIVE_FAST) * slow_factor
 
@@ -798,7 +784,6 @@ class Controller:
         self._head_backup_left = int(self.HEAD_BACKUP_DECISIONS)
         self._sidestep_decisions_left = 0
         self._stuck_decisions = 0
-        self._emergency_latch_left = 0
 
         backup = float(self.HEAD_BACKUP_DRIVE)
         return np.array([backup, backup])
@@ -1043,10 +1028,15 @@ class Controller:
         central_total = cen_L + cen_R
         size_raw = min(1.0, total_full / float(self.URGENT_TOTAL))
         central_raw = min(1.0, central_total / float(self.URGENT_CENTRAL))
-        if total_full < 1:
-            x_raw = 0.0
-        else:
+        # obs_x : direction des piques CENTRAUX (= dans le chemin).
+        # Évite que les piques peripheriques diluent l'info de direction.
+        # Fallback sur total quand pas de central.
+        if central_total >= 1:
+            x_raw = float(cen_R - cen_L) / float(central_total)
+        elif total_full >= 1:
             x_raw = float(tot_R - tot_L) / float(total_full)
+        else:
+            x_raw = 0.0
 
         ema = float(self.VIS_EMA)
         self._vis_obs_size = ema * self._vis_obs_size + (1.0 - ema) * size_raw
