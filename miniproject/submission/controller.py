@@ -186,7 +186,16 @@ class Controller:
     # Champ de répulsion : bias += REPULSION_GAIN × (-obs_x) × obs_size
     # obs_x négatif = piques à gauche → bias positif → steer droite.
     # obs_size = magnitude (forte si gros piques en face).
-    REPULSION_GAIN = 2.5
+    REPULSION_GAIN = 5.0
+    VIS_SLOW_GAIN = 0.65            # plus on voit, plus on ralentit
+    VIS_SLOW_MIN = 0.30
+    # Dodge d'urgence quand pique imminent dans le central. La direction est
+    # LATCHÉE pour EMERGENCY_LATCH_DECISIONS pour éviter le flip-flop entre
+    # piques alternés.
+    CENTRAL_TRIGGER = 0.30
+    EMERGENCY_GAIN = 3.5
+    URGENT_CENTRAL = 120
+    EMERGENCY_LATCH_DECISIONS = 12  # ~300 ms à 40 dec/s
     AVOID_MIN_DURATION = 4
     AVOID_CLEAR_DECISIONS = 1
     AVOID_DISABLE_CLOSE_DIST = 8.0  # < 8 m banane : on fonce
@@ -249,6 +258,10 @@ class Controller:
         # Vision state — détection sky-vert-sky sur l'image RGB brute
         self._vis_obs_size = 0.0
         self._vis_obs_x = 0.0
+        self._vis_central_size = 0.0     # magnitude du blocker imminent
+        self._vis_peripheral_asym = 0.0  # asymétrie L/R périphérique
+        self._emergency_latch_left = 0
+        self._emergency_dir = +1.0
         self._vis_debug_overlay = None
 
         # AVOID FSM state
@@ -640,12 +653,26 @@ class Controller:
             obs_size, obs_x = self._vision_step(sim)
 
         # ---- Champ de répulsion (= remplace AVOID FSM) ----
-        # bias = target_bias + REPULSION_GAIN * (-obs_x) * obs_size
-        # obs_x négatif (piques à gauche) → bias positif → steer droite.
-        # obs_size = magnitude scalaire (proximité). AVOID FSM seuil tellement
-        # haut qu'il ne se déclenche jamais ; on garde le code pour le debug
-        # mais en pratique on est toujours en GO + repulsion.
+        # bias = target + REPULSION × (-obs_x) × obs_size
+        # + emergency_dodge si blocker droit devant (central élevé)
         repulsion = float(self.REPULSION_GAIN) * (-obs_x) * obs_size
+        emergency_dodge = 0.0
+        central_size = float(getattr(self, "_vis_central_size", 0.0))
+        if self._emergency_latch_left > 0:
+            self._emergency_latch_left -= 1
+        if central_size > float(self.CENTRAL_TRIGGER):
+            if self._emergency_latch_left <= 0:
+                # Choix direction d'esquive (latché pour ne pas flip-flop)
+                asym = float(self._vis_peripheral_asym)
+                if abs(asym) < 0.05:
+                    self._emergency_dir = 1.0 if target_bias > 0.0 else -1.0
+                else:
+                    self._emergency_dir = -1.0 if asym > 0.0 else 1.0
+                self._emergency_latch_left = int(self.EMERGENCY_LATCH_DECISIONS)
+            emergency_dodge = (
+                float(self.EMERGENCY_GAIN) * float(self._emergency_dir) * central_size
+            )
+
         self._update_avoid_state(obs_size, obs_x)
 
         if self._avoid_left > 0:
@@ -657,8 +684,12 @@ class Controller:
                 target_bias, obs_x, obs_size, _upright
             )
         else:
-            bias = float(target_bias) + repulsion
-            base_drive = float(self.BASE_DRIVE_FAST)
+            bias = float(target_bias) + repulsion + emergency_dodge
+            # Ralentissement : plus on voit de piques, plus on ralentit pour
+            # laisser le steering les esquiver proprement.
+            slow_factor = 1.0 - float(self.VIS_SLOW_GAIN) * obs_size
+            slow_factor = max(float(self.VIS_SLOW_MIN), slow_factor)
+            base_drive = float(self.BASE_DRIVE_FAST) * slow_factor
             sub_mode = "GO"
 
         # ---- Terrain (slope) ----
@@ -1036,8 +1067,8 @@ class Controller:
         if frames is None or len(frames) == 0:
             return float(self._vis_obs_size), float(self._vis_obs_x)
 
-        tot_L, _ = self._eye_spike_counts(frames[0], is_left_eye=True)
-        tot_R, _ = self._eye_spike_counts(
+        tot_L, cen_L = self._eye_spike_counts(frames[0], is_left_eye=True)
+        tot_R, cen_R = self._eye_spike_counts(
             frames[1] if len(frames) > 1 else frames[0], is_left_eye=False
         )
         # Pour le champ de répulsion :
@@ -1054,6 +1085,17 @@ class Controller:
         ema = float(self.VIS_EMA)
         self._vis_obs_size = ema * self._vis_obs_size + (1.0 - ema) * size_raw
         self._vis_obs_x = ema * self._vis_obs_x + (1.0 - ema) * x_raw
+        # Central : magnitude du blocker imminent + asymétrie périphérique
+        central_total = cen_L + cen_R
+        central_size = min(1.0, central_total / float(self.URGENT_CENTRAL))
+        if total_full > 0:
+            self._vis_peripheral_asym = float(tot_R - tot_L) / float(total_full)
+        else:
+            self._vis_peripheral_asym = 0.0
+        self._vis_central_size = (
+            ema * float(getattr(self, "_vis_central_size", 0.0))
+            + (1.0 - ema) * central_size
+        )
         return float(self._vis_obs_size), float(self._vis_obs_x)
 
     # ------------------------------------------------------------------
