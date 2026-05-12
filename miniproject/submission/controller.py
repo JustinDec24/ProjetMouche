@@ -127,28 +127,33 @@ class Controller:
     # lui, on trouve un ommatidium clair (= du ciel). Élimine les pixels
     # sombres qui ne sont pas vraiment des obstacles (texture sol, fond, etc).
     VISION_ENABLE = True
-    BLADE_DARK_THRESH = 0.20        # ommatidium sombre si sum_intensity < 0.20
-    # Test "comme un pique sur fond bleu" :
-    #   1) ommatidium sombre
-    #   2) au-dessus dans la même colonne, il y a un omm plus clair (= ciel)
-    #   3) sur au moins un côté (gauche OU droite), il y a un omm plus clair
-    # Le critère 3 garantit que c'est étroit (vertical) — un mur ou un large
-    # obstacle aurait du sombre des deux côtés, pas de fond bleu latéral.
-    VIS_SKY_CONTRAST_THRESH = 0.15
-    VIS_SAMECOL_TOL_FRAC = 0.08     # tolérance colonne (8% largeur)
-    VIS_SAMEROW_TOL_FRAC = 0.05     # tolérance ligne (5% hauteur)
+    # Détection COULEUR : un brin d'herbe est VERT (G > R, G > B). Le ciel est
+    # bleu (B dominant) ou achromatique brillant (nuages gris/blancs).
+    # On compte les ommatidia verts situés AU-DESSUS de la ligne d'horizon
+    # (par colonne rétinienne) = ce qui dépasse de l'horizon sur fond bleu/gris.
+    VIS_GREEN_DELTA = 0.10          # G - R > delta ET G - B > delta (vert franc)
+    VIS_GREEN_MIN = 0.30            # G doit être > 0.30
+    VIS_SKY_BLUE_MARGIN = 0.03      # B + margin >= R et B + margin >= G
+    VIS_SKY_GREY_SPREAD_MAX = 0.18  # max(R,G,B) - min(R,G,B) < spread → achromatique
+    VIS_SKY_MIN_SUM = 0.90          # somme RGB > 0.90 (assez brillant pour être ciel)
+    # Test "pique vert sur fond bleu" : pour qu'un omm vert soit compté comme
+    # silhouette, il faut que :
+    #   1) l'omm directement AU-DESSUS (même colonne rétinienne) soit du ciel
+    #   2) l'omm à GAUCHE ou à DROITE (même ligne) soit du ciel
+    # Ça filtre les masses vertes (hills) qui n'ont pas de ciel latéral.
+    VIS_SAMECOL_TOL_FRAC = 0.08
+    VIS_SAMEROW_TOL_FRAC = 0.05
     BLADE_COUNT_URGENT = 12         # normalisation : obs_size = max(dL,dR)/URGENT
-    VIS_EMA = 0.55                  # lissage des signaux
+    VIS_EMA = 0.55
     VIS_STARTUP_DELAY_DECISIONS = 8
-    # Masque frontal : ommatidia qui regardent vraiment devant la mouche.
-    # Œil gauche : moitié droite de l'image (nasal) ; symétrique pour œil droit.
-    VIS_FRONTAL_FRAC = 0.40
-    VIS_UPPER_FRAC = 0.50           # moitié haute du champ (au-dessus horizon)
+    # Masque frontal-haut par œil
+    VIS_FRONTAL_FRAC = 0.55
+    VIS_UPPER_FRAC = 0.50
 
     # --- AVOID FSM (déclenchement / sortie) ---
-    AVOID_SIZE_ON = 0.45            # entre AVOID (~5-6 omms pique-shape)
-    AVOID_SIZE_OFF = 0.20           # sort AVOID (~2 omms)
-    AVOID_SIZE_MED = 0.80           # "obstacle moyen" → dodge × 1.0
+    AVOID_SIZE_ON = 0.60            # entre AVOID (~7 omms pique vert, signal clair)
+    AVOID_SIZE_OFF = 0.25           # sort AVOID (~3 omms)
+    AVOID_SIZE_MED = 0.85           # "obstacle moyen" → dodge × 1.0
     AVOID_MIN_DURATION = 4
     AVOID_CLEAR_DECISIONS = 1
     AVOID_DISABLE_CLOSE_DIST = 8.0  # < 8 m banane : on fonce
@@ -208,7 +213,7 @@ class Controller:
         self._scan_dir = +1
         self._last_target_bias = 0.0
 
-        # Vision state (silhouette pique → EMA(obs_size, obs_x))
+        # Vision state (pique vert + ciel-haut + ciel-côté → EMA(obs_size, obs_x))
         self._vis_obs_size = 0.0
         self._vis_obs_x = 0.0
         self._frontal_mask_left: np.ndarray | None = None
@@ -219,6 +224,10 @@ class Controller:
         self._left_valid: np.ndarray | None = None
         self._right_idx: np.ndarray | None = None
         self._right_valid: np.ndarray | None = None
+        # Mapping raw RGB → per-ommatidium RGB (pour la détection couleur)
+        self._om_map_flat: np.ndarray | None = None
+        self._num_pixels_per_omm: np.ndarray | None = None
+        self._n_omm: int = 0
         self._vis_debug_overlay = None
 
         # AVOID FSM state
@@ -267,6 +276,13 @@ class Controller:
                     col_tol_frac=float(self.VIS_SAMECOL_TOL_FRAC),
                     row_tol_frac=float(self.VIS_SAMEROW_TOL_FRAC),
                 )
+                self._om_map_flat = np.asarray(
+                    retina.ommatidia_id_map, dtype=np.int32
+                ).ravel()
+                self._num_pixels_per_omm = np.asarray(
+                    retina.num_pixels_per_ommatidia, dtype=np.int32
+                )
+                self._n_omm = int(retina.num_ommatidia_per_eye)
             except Exception:
                 self._frontal_mask_left = None
                 self._frontal_mask_right = None
@@ -276,6 +292,9 @@ class Controller:
                 self._left_valid = None
                 self._right_idx = None
                 self._right_valid = None
+                self._om_map_flat = None
+                self._num_pixels_per_omm = None
+                self._n_omm = 0
 
         try:
             self._banana_xy = np.asarray(sim.world.banana_xy, dtype=float)
@@ -906,18 +925,12 @@ class Controller:
         row_tol_frac: float,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
                np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Précompute pour la vision silhouette "pique sur fond bleu".
+        """Précompute des masques + indices voisins (haut, gauche, droite).
 
-        Retourne huit arrays :
-          mask_left/right        : ommatidia frontaux-supérieurs par œil
-          col_top_idx/valid      : pour chaque omm i, indice de l'omm le plus
-                                   haut (row min) dans la même colonne. C'est
-                                   "le ciel possible au-dessus" de cette omm.
-          left_idx/valid         : omm le plus proche à GAUCHE (col<) dans la
-                                   même ligne. Sert au test côté gauche.
-          right_idx/valid        : omm le plus proche à DROITE dans la ligne.
-
-        Test runtime : pique = sombre ET col_top clair ET (left clair OU right clair).
+        Pour chaque ommatidium i :
+          col_top_idx[i] = omm avec row min en même colonne (= ciel possible au-dessus)
+          left_idx[i]    = omm à gauche en même ligne (col_j < col_i, row ≈ row_i)
+          right_idx[i]   = omm à droite en même ligne
         """
         om_map = np.asarray(retina.ommatidia_id_map)
         nrows, ncols = om_map.shape
@@ -943,23 +956,20 @@ class Controller:
         np.fill_diagonal(same_col, False)
         np.fill_diagonal(same_row, False)
 
-        # col_top : pour chaque i, omm avec row_j minimal en même colonne.
-        # = argmax sur (-rows[j]) sous le masque same_col.
+        # col_top : argmin(rows[j]) sous same_col
         scores_top = np.where(same_col, -rows[None, :], -np.inf)
         col_top_idx = np.argmax(scores_top, axis=1).astype(np.int64)
         col_top_valid = np.isfinite(scores_top[np.arange(n_omm), col_top_idx])
         col_top_idx[~col_top_valid] = 0
 
-        # left : pour chaque i, omm le plus proche à gauche en même ligne.
-        # candidat = same_row ET col_j < col_i. argmax sur col_j (= plus à droite
-        # parmi ceux à gauche = le plus proche).
+        # left : argmax(cols[j]) parmi same_row & col_j < col_i
         cand_left = same_row & (cols[None, :] < cols[:, None])
         scores_left = np.where(cand_left, cols[None, :], -np.inf)
         left_idx = np.argmax(scores_left, axis=1).astype(np.int64)
         left_valid = np.isfinite(scores_left[np.arange(n_omm), left_idx])
         left_idx[~left_valid] = 0
 
-        # right : symétrique. argmax sur (-col_j) parmi ceux à droite.
+        # right : argmax(-cols[j]) parmi same_row & col_j > col_i
         cand_right = same_row & (cols[None, :] > cols[:, None])
         scores_right = np.where(cand_right, -cols[None, :], -np.inf)
         right_idx = np.argmax(scores_right, axis=1).astype(np.int64)
@@ -973,16 +983,48 @@ class Controller:
             right_idx, right_valid,
         )
 
+    def _per_omm_rgb(self, sim) -> "np.ndarray | None":
+        """Agrège l'image RGB brute par ommatidium → array shape (2, n_omm, 3)."""
+        if (
+            self._om_map_flat is None
+            or self._num_pixels_per_omm is None
+            or self._n_omm == 0
+        ):
+            return None
+        try:
+            raw_vision = sim.get_raw_vision(sim.fly.name)
+        except Exception:
+            return None
+        if raw_vision is None or len(raw_vision) == 0:
+            return None
+        n_omm = self._n_omm
+        out = np.zeros((2, n_omm, 3), dtype=np.float32)
+        n_eyes = min(2, len(raw_vision))
+        for eye_idx in range(n_eyes):
+            img = np.asarray(raw_vision[eye_idx], dtype=np.float32)
+            if img.ndim != 3 or img.shape[-1] < 3:
+                continue
+            if img.max() > 1.5:    # uint8 image, normalize
+                img = img / 255.0
+            img_flat = img.reshape(-1, 3)
+            for c in range(3):
+                sums = np.bincount(
+                    self._om_map_flat,
+                    weights=img_flat[:, c],
+                    minlength=n_omm + 1,
+                )[1 : n_omm + 1]
+                out[eye_idx, :, c] = sums / np.maximum(self._num_pixels_per_omm, 1)
+        if n_eyes == 1:
+            out[1] = out[0]
+        return out
+
     def _vision_step(self, sim) -> tuple[float, float]:
-        """Détecte silhouettes "pique sur fond bleu" → (obs_size, obs_x).
+        """Détecte 'pique vert sur fond bleu' → (obs_size, obs_x).
 
-        Pour chaque omm sombre, on exige :
-          1. Ciel au-dessus (col_top plus clair que self)
-          2. Ciel sur au moins un côté (left OU right plus clair que self)
-        Garantit qu'on ne compte QUE les structures étroites et verticales.
-
-        - obs_size = max(dL, dR) / BLADE_COUNT_URGENT, clipé [0, 1]
-        - obs_x ∈ [-1, +1] : (dR - dL) / (dR + dL)
+        Pour chaque omm vert dans la zone frontale-haute, on exige :
+          1. l'omm directement au-dessus (col_top, même colonne) est du CIEL
+          2. l'omm à gauche OU à droite (même ligne) est du CIEL
+        Filtre les masses vertes (hills, fond) qui n'ont pas de ciel latéral.
         """
         if (
             self._frontal_mask_left is None
@@ -994,29 +1036,38 @@ class Controller:
         if self._debug_decisions < int(self.VIS_STARTUP_DELAY_DECISIONS):
             return float(self._vis_obs_size), float(self._vis_obs_x)
 
-        try:
-            ommatidia = sim.get_ommatidia_readouts(sim.fly.name)
-        except Exception:
+        per_omm_rgb = self._per_omm_rgb(sim)
+        if per_omm_rgb is None:
             return float(self._vis_obs_size), float(self._vis_obs_x)
 
-        sum_int = ommatidia.sum(axis=-1)  # shape (2, n_omm)
-        dark_mask = sum_int < float(self.BLADE_DARK_THRESH)
+        r_ch = per_omm_rgb[..., 0]
+        g_ch = per_omm_rgb[..., 1]
+        b_ch = per_omm_rgb[..., 2]
+        sum_int = r_ch + g_ch + b_ch
 
-        # Triple test en contraste : au-dessus + au moins un côté.
-        thresh = float(self.VIS_SKY_CONTRAST_THRESH)
-        ct_top = sum_int[:, self._col_top_idx] - sum_int        # (2, n_omm)
-        ct_left = sum_int[:, self._left_idx] - sum_int
-        ct_right = sum_int[:, self._right_idx] - sum_int
+        delta = float(self.VIS_GREEN_DELTA)
+        gmin = float(self.VIS_GREEN_MIN)
+        bm = float(self.VIS_SKY_BLUE_MARGIN)
+        spread_max = float(self.VIS_SKY_GREY_SPREAD_MAX)
+        sky_min = float(self.VIS_SKY_MIN_SUM)
 
-        top_bright = (ct_top > thresh) & self._col_top_valid[None, :]
-        left_bright = (ct_left > thresh) & self._left_valid[None, :]
-        right_bright = (ct_right > thresh) & self._right_valid[None, :]
+        is_green = ((g_ch - r_ch) > delta) & ((g_ch - b_ch) > delta) & (g_ch > gmin)
+        mx = np.maximum(np.maximum(r_ch, g_ch), b_ch)
+        mn = np.minimum(np.minimum(r_ch, g_ch), b_ch)
+        blue_dom = (b_ch + bm >= r_ch) & (b_ch + bm >= g_ch)
+        low_sat = (mx - mn) < spread_max
+        is_sky = (blue_dom | low_sat) & (sum_int > sky_min) & (~is_green)
 
-        # "Pique" : sombre ET ciel-haut ET ciel sur au moins un côté.
-        spike = dark_mask & top_bright & (left_bright | right_bright)
+        # Lookup voisins (2, n_omm) : is_sky[eye, col_top_idx[i]] etc.
+        top_sky = is_sky[:, self._col_top_idx] & self._col_top_valid[None, :]
+        left_sky = is_sky[:, self._left_idx] & self._left_valid[None, :]
+        right_sky = is_sky[:, self._right_idx] & self._right_valid[None, :]
 
-        dL = int((spike[0] & self._frontal_mask_left).sum())
-        dR = int((spike[1] & self._frontal_mask_right).sum())
+        # Pique vert : vert ET ciel-haut ET ciel sur au moins un côté
+        silhouette = is_green & top_sky & (left_sky | right_sky)
+
+        dL = int((silhouette[0] & self._frontal_mask_left).sum())
+        dR = int((silhouette[1] & self._frontal_mask_right).sum())
 
         total_dark = dL + dR
         if total_dark < 1:
@@ -1155,25 +1206,42 @@ class Controller:
         ):
             return None
         try:
-            ommatidia = sim.get_ommatidia_readouts(sim.fly.name)
             retina = sim.world.fly_lookup[sim.fly.name].retina
         except Exception:
             return None
-        sum_intensity = ommatidia.sum(axis=-1)
+        per_omm_rgb = self._per_omm_rgb(sim)
+        if per_omm_rgb is None:
+            return None
+
+        r_ch = per_omm_rgb[..., 0]
+        g_ch = per_omm_rgb[..., 1]
+        b_ch = per_omm_rgb[..., 2]
+        sum_intensity = r_ch + g_ch + b_ch
+
+        delta = float(self.VIS_GREEN_DELTA)
+        gmin = float(self.VIS_GREEN_MIN)
+        bm = float(self.VIS_SKY_BLUE_MARGIN)
+        spread_max = float(self.VIS_SKY_GREY_SPREAD_MAX)
+        sky_min = float(self.VIS_SKY_MIN_SUM)
+        is_green = ((g_ch - r_ch) > delta) & ((g_ch - b_ch) > delta) & (g_ch > gmin)
+        mx = np.maximum(np.maximum(r_ch, g_ch), b_ch)
+        mn = np.minimum(np.minimum(r_ch, g_ch), b_ch)
+        blue_dom = (b_ch + bm >= r_ch) & (b_ch + bm >= g_ch)
+        low_sat = (mx - mn) < spread_max
+        is_sky = (blue_dom | low_sat) & (sum_intensity > sky_min) & (~is_green)
+        top_sky = is_sky[:, self._col_top_idx] & self._col_top_valid[None, :]
+        left_sky = is_sky[:, self._left_idx] & self._left_valid[None, :]
+        right_sky = is_sky[:, self._right_idx] & self._right_valid[None, :]
+        silhouette_per_eye = is_green & top_sky & (left_sky | right_sky)
+
         eye_masks = (self._frontal_mask_left, self._frontal_mask_right)
-        thresh = float(self.VIS_SKY_CONTRAST_THRESH)
         try:
             frames = []
             for eye_idx in range(2):
                 base = retina.hex_pxls_to_human_readable(sum_intensity[eye_idx])
                 base_norm = (np.clip(base / max(base.max(), 1e-6), 0, 1) * 255).astype(np.uint8)
                 rgb = np.stack([base_norm, base_norm, base_norm], axis=-1)
-                si = sum_intensity[eye_idx]
-                dark = si < self.BLADE_DARK_THRESH
-                top_bright = ((si[self._col_top_idx] - si) > thresh) & self._col_top_valid
-                left_bright = ((si[self._left_idx] - si) > thresh) & self._left_valid
-                right_bright = ((si[self._right_idx] - si) > thresh) & self._right_valid
-                silhouette = dark & top_bright & (left_bright | right_bright) & eye_masks[eye_idx]
+                silhouette = silhouette_per_eye[eye_idx] & eye_masks[eye_idx]
                 if silhouette.any():
                     mark_img = retina.hex_pxls_to_human_readable(silhouette.astype(np.float32))
                     mask = mark_img > 0.1
