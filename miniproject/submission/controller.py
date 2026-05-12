@@ -1,15 +1,16 @@
-"""Controller — MERGE de spike-ciel-sky-border et REFONTE_COMPLETE.
+"""Controller fly-to-banana.
 
-Combinaison :
-  - FSM ALIGN / GO / AVOID arc-dodge (spike-ciel-sky-border)
-  - Steering tropotaxis olfactif canonique week4 (gain=-500, bias²) +
-    scan/cast quand l'odeur est perdue (REFONTE_COMPLETE)
-  - Vision silhouette ommatidia (REFONTE_COMPLETE) adaptée en
-    (obs_size, obs_x) consommé par la FSM AVOID
-  - Réflexe head-collision 3 phases : BACKUP → TURN → BYPASS (REFONTE)
-  - Anti-jam : SIDESTEP_NOPROG (REFONTE) — déclenche backup + side-step si la
-    mouche ne progresse plus vers la banane ou si son roll devient instable
-  - Compensation pente, grip terrain, tilt-lean, recovery flip (commun)
+Architecture :
+  - ALIGN initial (pivot vers la banane via bearing géométrique)
+  - Steering tropotaxis olfactif (gain=-500, bias²) + scan/cast si odeur perdue
+  - Vision : silhouette pique vert sur fond bleu/gris (sky-vert-sky + CC)
+  - Navigation par CHAMP DE RÉPULSION :
+        bias = target_bias + REPULSION × (-obs_x) × obs_size
+                            + emergency_dodge (latché, si pique central)
+    où obs_size = blocker central, obs_x = direction des piques.
+  - Head-collision 3 phases (BACKUP → TURN → BYPASS) en dernier recours
+  - SIDESTEP no-progress (anti-jam terrain)
+  - Compensation pente, grip terrain, tilt-lean, flip-recovery
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ from miniproject.simulation import MiniprojectSimulation
 
 
 class Controller:
-    """Controller mergé : olfaction tropotaxis + vision silhouette + AVOID FSM."""
+    """Controller fly-to-banana : olfaction + vision silhouette + champ de répulsion."""
 
     # --- scheduling ---
     DECISION_INTERVAL_S = 0.025  # 25 ms = 40 décisions/s
@@ -53,7 +54,6 @@ class Controller:
     MIN_SIDE_DRIVE = 0.40
     MIN_SIDE_DRIVE_TERRAIN = 0.25
     TURN_MOD = 0.8
-    AVOID_TURN_MOD = 1.0  # plein différentiel pendant AVOID
 
     # --- terrain (Level 1+) ---
     DOWNHILL_BRAKE = 1.6
@@ -109,9 +109,6 @@ class Controller:
     ALIGN_SPIN_SLOW = -0.30
     ALIGN_TRANSITION_DECISIONS = 5
     ALIGN_TRANSITION_DRIVE = 1.50
-    # Réalignement après un AVOID prolongé
-    ALIGN_AFTER_AVOID_ENABLE = True
-    ALIGN_AFTER_AVOID_MIN_DECISIONS = 8
 
     # --- head-collision recovery (3 phases) ---
     HEAD_COLLISION_ENABLE = True
@@ -160,51 +157,40 @@ class Controller:
     #     VERTICALES (piques) et rejette les masses larges/horizontales (hills)
     VIS_SPIKE_MIN_HEIGHT = 6        # blob doit s'étendre verticalement
     VIS_SPIKE_MAX_WIDTH = 35        # largeur max ciel-borders (allow close blades)
-    # Bande CENTRALE pour déclencher AVOID : on détecte tous les piques pour la
-    # direction (obs_x) mais on ne déclenche AVOID que si la zone DIRECTEMENT
-    # DEVANT la mouche est bloquée. Pour l'œil gauche, le frontal pur = côté
-    # nasal = bord DROIT de la ROI. Symétrique pour œil droit.
+    # Bande CENTRALE = ce qui bloque vraiment le chemin
     VIS_CENTRAL_FRAC = 0.22         # ~22% nasal-most de la ROI par œil
-    BLADE_COUNT_URGENT = 600        # count central élevé → trigger seulement sur gros blocker
     VIS_EMA = 0.55
     VIS_STARTUP_DELAY_DECISIONS = 8
-    # ROI : on étend la zone verticale jusqu'à 0.75 pour capturer le CORPS des
-    # piques (pas juste la pointe). L'horizon-band est plate et large → rejetée
-    # par le filtre aspect-ratio. Frontal nasal à 0.70 reste assez large.
+    # ROI : 75% en hauteur, 70% nasal en largeur
     VIS_FRONTAL_FRAC = 0.70
     VIS_UPPER_FRAC = 0.75
 
-    # --- AVOID FSM (déclenchement / sortie) ---
-    # AVOID FSM désactivé (seuil très haut) — remplacé par champ de répulsion
-    # continu en addition au target_bias dans _compute_drives. Le champ donne
-    # un steering progressif qui trouve les gaps dans une forêt dense, là où
-    # le AVOID arc-dodge oscillait.
-    AVOID_SIZE_ON = 2.0
-    AVOID_SIZE_OFF = 1.5
-    AVOID_SIZE_MED = 0.85
-
-    # Champ de répulsion : bias += REPULSION_GAIN × (-obs_x) × obs_size
-    # obs_x négatif = piques à gauche → bias positif → steer droite.
-    # obs_size = magnitude (forte si gros piques en face).
-    REPULSION_GAIN = 5.0
-    VIS_SLOW_GAIN = 0.65            # plus on voit, plus on ralentit
-    VIS_SLOW_MIN = 0.30
-    # Dodge d'urgence quand pique imminent dans le central. La direction est
-    # LATCHÉE pour EMERGENCY_LATCH_DECISIONS pour éviter le flip-flop entre
-    # piques alternés.
-    CENTRAL_TRIGGER = 0.30
-    EMERGENCY_GAIN = 3.5
-    URGENT_CENTRAL = 120
-    EMERGENCY_LATCH_DECISIONS = 12  # ~300 ms à 40 dec/s
-    AVOID_MIN_DURATION = 4
-    AVOID_CLEAR_DECISIONS = 1
-    AVOID_DISABLE_CLOSE_DIST = 8.0  # < 8 m banane : on fonce
-    AVOID_TURN_MAX = 1.0
-    AVOID_CENTER_EPS = 0.05         # |obs_x| < eps → tiebreak côté banane
-    AVOID_BANANA_BLEND = 0.5        # mélange du target_bias pendant AVOID
-    AVOID_REFRESH_DELTA = 0.30      # latch refresh si signal très différent
-    AVOID_SPEED_FRAC = 0.60         # vitesse pendant AVOID (× BASE_DRIVE_FAST)
-    VIS_TURN_MAX = 3.0              # saturation universelle du bias
+    # Champ de répulsion :
+    #   bias = target_bias                                  (attraction banane)
+    #        + REPULSION × (-obs_x) × obs_size              (douce et continue)
+    #        + EMERGENCY × dir_latched × central_size       (forte si imminent)
+    # La répulsion continue est volontairement faible pour que target_bias
+    # domine quand les piques sont peripheriques ou lointains. EMERGENCY
+    # n'active que quand un blocker tombe pile dans le central.
+    # Pondération des trois forces qui composent le steering :
+    #   bias = TARGET_GAIN × target_bias  (attraction banane, dominante)
+    #        + REPULSION_GAIN × (-obs_x) × obs_size  (répulsion continue)
+    #        + EMERGENCY_GAIN × dir_latched × central_size  (dodge urgent)
+    # TARGET_GAIN > REPULSION+EMERGENCY → la mouche ne reste pas piégée à
+    # esquiver indéfiniment, elle finit par chercher un chemin vers la banane.
+    TARGET_GAIN = 3.0
+    REPULSION_GAIN = 2.0
+    URGENT_TOTAL = 500              # normalisation pour obs_size (count total)
+    URGENT_CENTRAL = 200            # normalisation pour central_size
+    # Ralentissement quand piques en vue → plus de temps physique pour esquiver
+    VIS_SLOW_GAIN = 0.85
+    VIS_SLOW_MIN = 0.18
+    # Dodge d'urgence (latché) : forte quand un blocker est imminent au centre
+    CENTRAL_TRIGGER = 0.35
+    EMERGENCY_GAIN = 2.5
+    EMERGENCY_LATCH_DECISIONS = 10
+    # Saturation du bias avant tanh (anti-violent-turn)
+    VIS_TURN_MAX = 3.0
 
     # --- debug ---
     DEBUG = True
@@ -256,20 +242,12 @@ class Controller:
         self._last_target_bias = 0.0
 
         # Vision state — détection sky-vert-sky sur l'image RGB brute
-        self._vis_obs_size = 0.0
+        self._vis_obs_size = 0.0        # magnitude TOTAL (toutes piques visibles)
         self._vis_obs_x = 0.0
-        self._vis_central_size = 0.0     # magnitude du blocker imminent
-        self._vis_peripheral_asym = 0.0  # asymétrie L/R périphérique
+        self._vis_central_size = 0.0    # magnitude CENTRAL (blocker imminent)
         self._emergency_latch_left = 0
         self._emergency_dir = +1.0
         self._vis_debug_overlay = None
-
-        # AVOID FSM state
-        self._avoid_left = 0
-        self._avoid_min_left = 0
-        self._avoid_clear = 0
-        self._latched_obs_x = 0.0
-        self._avoid_session_ticks = 0
 
         # SIDESTEP no-progress state
         self._dist_history: list[float] = []
@@ -403,10 +381,9 @@ class Controller:
                 self._stopped = True
                 return np.zeros_like(joint_angles), np.zeros_like(adhesion)
 
-            in_avoid = self._avoid_left > 0
             grip_val = (
                 float(self.WIND_GRIP_FORCE)
-                if (self._enable_wind or in_avoid)
+                if self._enable_wind
                 else float(self.TERRAIN_GRIP_FORCE)
             )
             try:
@@ -652,49 +629,40 @@ class Controller:
         if self.VISION_ENABLE and self._enable_grass:
             obs_size, obs_x = self._vision_step(sim)
 
-        # ---- Champ de répulsion (= remplace AVOID FSM) ----
-        # bias = target + REPULSION × (-obs_x) × obs_size
-        # + emergency_dodge si blocker droit devant (central élevé)
+        # ---- Champ de répulsion ----
+        # obs_size = magnitude total (piques visibles, périphérique compris)
+        # central_size = blocker imminent (déclenche l'emergency dodge)
+        # Répulsion continue d'amplitude obs_size dans direction -obs_x.
+        # target_bias domine quand obs_size est petit (= pas de piques en vue).
+        central_size = float(self._vis_central_size)
         repulsion = float(self.REPULSION_GAIN) * (-obs_x) * obs_size
         emergency_dodge = 0.0
-        central_size = float(getattr(self, "_vis_central_size", 0.0))
         if self._emergency_latch_left > 0:
             self._emergency_latch_left -= 1
         if central_size > float(self.CENTRAL_TRIGGER):
             if self._emergency_latch_left <= 0:
-                # Choix direction d'esquive (latché pour ne pas flip-flop)
-                asym = float(self._vis_peripheral_asym)
-                if abs(asym) < 0.05:
+                # Choix de la direction d'esquive (latchée pour éviter flip-flop)
+                if abs(obs_x) < 0.05:
                     self._emergency_dir = 1.0 if target_bias > 0.0 else -1.0
                 else:
-                    self._emergency_dir = -1.0 if asym > 0.0 else 1.0
+                    self._emergency_dir = -1.0 if obs_x > 0.0 else 1.0
                 self._emergency_latch_left = int(self.EMERGENCY_LATCH_DECISIONS)
             emergency_dodge = (
                 float(self.EMERGENCY_GAIN) * float(self._emergency_dir) * central_size
             )
 
-        self._update_avoid_state(obs_size, obs_x)
-
-        if self._avoid_left > 0:
-            try:
-                _, _, _upright = self._get_orientation(sim)
-            except Exception:
-                _upright = 1.0
-            bias, base_drive, sub_mode = self._avoid_command(
-                target_bias, obs_x, obs_size, _upright
-            )
-        else:
-            bias = float(target_bias) + repulsion + emergency_dodge
-            # Ralentissement : plus on voit de piques, plus on ralentit pour
-            # laisser le steering les esquiver proprement.
-            slow_factor = 1.0 - float(self.VIS_SLOW_GAIN) * obs_size
-            slow_factor = max(float(self.VIS_SLOW_MIN), slow_factor)
-            base_drive = float(self.BASE_DRIVE_FAST) * slow_factor
-            sub_mode = "GO"
+        # Steering = TARGET × attraction banane + répulsion + emergency dodge.
+        # TARGET_GAIN > 1 garantit que la banane reste influente même quand
+        # la mouche détecte des piques de tous côtés.
+        bias = float(self.TARGET_GAIN) * float(target_bias) + repulsion + emergency_dodge
+        # Ralentissement : plus le pique central est gros, plus on ralentit
+        # pour laisser le temps d'esquiver.
+        slow_factor = 1.0 - float(self.VIS_SLOW_GAIN) * obs_size
+        slow_factor = max(float(self.VIS_SLOW_MIN), slow_factor)
+        base_drive = float(self.BASE_DRIVE_FAST) * slow_factor
 
         # ---- Terrain (slope) ----
         turn_mod = self.TURN_MOD
-        slope_mag = 0.0
         if self._enable_terrain:
             slope_forward, slope_lateral, slope_mag = self._get_slope_signals(sim)
             downhill = max(0.0, -slope_forward)
@@ -709,9 +677,8 @@ class Controller:
             bias += float(np.clip(slope_bias, -self.SLOPE_STEER_MAX, self.SLOPE_STEER_MAX))
             turn_mod = turn_mod / (1.0 + self.TURN_STEEP_GAIN * max(0.0, slope_mag))
 
-        if self._avoid_left > 0:
-            turn_mod = float(self.AVOID_TURN_MOD)
-
+        # Saturation universelle bias avant tanh
+        bias = float(np.clip(bias, -float(self.VIS_TURN_MAX), float(self.VIS_TURN_MAX)))
         bias_norm = float(np.tanh(bias))
 
         min_drive = self.MIN_DRIVE_TERRAIN if self._enable_terrain else self.MIN_DRIVE
@@ -725,13 +692,6 @@ class Controller:
         drives[side] = max(min_side, drives[side])
         drives = np.clip(drives, 0.0, max_drive)
 
-        # Slope-adaptive AVOID : sur pente raide, blend pour éviter flip
-        if self._avoid_left > 0 and self._enable_terrain and slope_mag > 0.20:
-            blend = 0.50 * float(np.clip((slope_mag - 0.20) / 0.20, 0.0, 1.0))
-            mean_d = float(np.mean(drives))
-            drives = drives * (1.0 - blend) + mean_d * blend
-            drives = np.clip(drives, 0.0, max_drive)
-
         if (
             self.DEBUG
             and self._debug_decisions <= self.DEBUG_MAX_DECISIONS
@@ -739,8 +699,7 @@ class Controller:
         ):
             dist_str = f"{dist_to_banana:.2f}" if dist_to_banana is not None else "?"
             print(
-                f"[dbg d={self._debug_decisions:4d}] mode={'AVOID' if self._avoid_left>0 else 'GO':5s} "
-                f"sub={sub_mode:5s} obs_x={obs_x:+.3f} obs_sz={obs_size:.3f} "
+                f"[dbg d={self._debug_decisions:4d}] obs_x={obs_x:+.3f} obs_sz={obs_size:.3f} "
                 f"odor_mean={mean_odor:.3e} target={target_bias:+.3f} dist={dist_str} "
                 f"bias={bias:+.3f} drives=({drives[0]:.2f},{drives[1]:.2f})",
                 flush=True,
@@ -837,11 +796,9 @@ class Controller:
 
         # Reset des autres FSM pour ne pas interférer
         self._head_backup_left = int(self.HEAD_BACKUP_DECISIONS)
-        self._avoid_left = 0
-        self._avoid_clear = 0
-        self._latched_obs_x = 0.0
         self._sidestep_decisions_left = 0
         self._stuck_decisions = 0
+        self._emergency_latch_left = 0
 
         backup = float(self.HEAD_BACKUP_DRIVE)
         return np.array([backup, backup])
@@ -865,6 +822,14 @@ class Controller:
             return np.array([self.SIDESTEP_DRIVE_SLOW, self.SIDESTEP_DRIVE_FAST])
 
         if not (self._enable_grass and self._banana_xy is not None):
+            return None
+
+        # Quand la vision détecte des piques (obs_size > 0.30), la mouche est
+        # légitimement ralentie pour esquiver → on NE doit pas déclencher
+        # SIDESTEP qui croirait à un blocage. On reset dist_history pour
+        # éviter une accumulation d'historique pendant le slowdown vision.
+        if float(self._vis_obs_size) > 0.30:
+            self._dist_history.clear()
             return None
 
         self._dist_history.append(float(self._last_dist_to_banana))
@@ -1071,145 +1036,23 @@ class Controller:
         tot_R, cen_R = self._eye_spike_counts(
             frames[1] if len(frames) > 1 else frames[0], is_left_eye=False
         )
-        # Pour le champ de répulsion :
-        # - obs_size = magnitude totale (proximité × nombre de piques)
-        # - obs_x    = position angulaire moyenne des piques en frame body
+        # obs_size       = magnitude TOTAL (piques visibles, ralentissement)
+        # obs_x          = asymétrie L/R totale (direction des piques)
+        # central_size   = magnitude CENTRAL (blocker imminent, emergency dodge)
         total_full = tot_L + tot_R
+        central_total = cen_L + cen_R
+        size_raw = min(1.0, total_full / float(self.URGENT_TOTAL))
+        central_raw = min(1.0, central_total / float(self.URGENT_CENTRAL))
         if total_full < 1:
-            size_raw = 0.0
             x_raw = 0.0
         else:
-            size_raw = min(1.0, total_full / float(self.BLADE_COUNT_URGENT))
             x_raw = float(tot_R - tot_L) / float(total_full)
 
         ema = float(self.VIS_EMA)
         self._vis_obs_size = ema * self._vis_obs_size + (1.0 - ema) * size_raw
         self._vis_obs_x = ema * self._vis_obs_x + (1.0 - ema) * x_raw
-        # Central : magnitude du blocker imminent + asymétrie périphérique
-        central_total = cen_L + cen_R
-        central_size = min(1.0, central_total / float(self.URGENT_CENTRAL))
-        if total_full > 0:
-            self._vis_peripheral_asym = float(tot_R - tot_L) / float(total_full)
-        else:
-            self._vis_peripheral_asym = 0.0
-        self._vis_central_size = (
-            ema * float(getattr(self, "_vis_central_size", 0.0))
-            + (1.0 - ema) * central_size
-        )
+        self._vis_central_size = ema * self._vis_central_size + (1.0 - ema) * central_raw
         return float(self._vis_obs_size), float(self._vis_obs_x)
-
-    # ------------------------------------------------------------------
-    # AVOID FSM (arc-dodge)
-    # ------------------------------------------------------------------
-    def _schedule_realign_after_long_avoid(self) -> None:
-        """Re-déclenche ALIGN si l'épisode AVOID était long."""
-        ticks = int(self._avoid_session_ticks)
-        self._avoid_session_ticks = 0
-        if not (self.ALIGN_ENABLE and self.ALIGN_AFTER_AVOID_ENABLE):
-            return
-        if ticks >= int(self.ALIGN_AFTER_AVOID_MIN_DECISIONS):
-            self._align_done = False
-            self._align_decisions = 0
-
-    def _update_avoid_state(self, obs_size: float, obs_x: float) -> None:
-        """Trigger / exit AVOID, latch obs_x à l'entrée."""
-        close_to_banana = (
-            self._last_dist_to_banana is not None
-            and self._last_dist_to_banana < float(self.AVOID_DISABLE_CLOSE_DIST)
-        )
-        if close_to_banana:
-            if self._avoid_left > 0:
-                self._avoid_left = 0
-                self._avoid_clear = 0
-                self._latched_obs_x = 0.0
-            return
-
-        on = obs_size >= float(self.AVOID_SIZE_ON)
-        off = obs_size <= float(self.AVOID_SIZE_OFF)
-
-        if self._avoid_left > 0:
-            self._avoid_session_ticks += 1
-            self._avoid_min_left = max(0, self._avoid_min_left - 1)
-            if off:
-                self._avoid_clear += 1
-            else:
-                self._avoid_clear = 0
-
-            if (
-                obs_size >= float(self.AVOID_SIZE_ON)
-                and abs(obs_x - self._latched_obs_x) > float(self.AVOID_REFRESH_DELTA)
-            ):
-                self._latched_obs_x = float(obs_x)
-
-            if (
-                self._avoid_min_left <= 0
-                and self._avoid_clear >= int(self.AVOID_CLEAR_DECISIONS)
-            ):
-                dist_str = (
-                    f"{self._last_dist_to_banana:.1f}"
-                    if self._last_dist_to_banana is not None
-                    else "?"
-                )
-                print(
-                    f"[OBS-] cleared after {self._avoid_session_ticks} ticks dist={dist_str}",
-                    flush=True,
-                )
-                self._schedule_realign_after_long_avoid()
-                self._avoid_left = 0
-                self._avoid_clear = 0
-                self._latched_obs_x = 0.0
-                return
-            self._avoid_left += 1
-        else:
-            if not on:
-                return
-            self._latched_obs_x = float(obs_x)
-            self._avoid_session_ticks = 0
-            self._avoid_left = 1
-            self._avoid_min_left = int(self.AVOID_MIN_DURATION)
-            self._avoid_clear = 0
-            dist_str = (
-                f"{self._last_dist_to_banana:.1f}"
-                if self._last_dist_to_banana is not None
-                else "?"
-            )
-            print(
-                f"[OBS+] dist={dist_str} obs_x={obs_x:+.3f} obs_sz={obs_size:.3f}",
-                flush=True,
-            )
-
-    def _avoid_command(
-        self,
-        target_bias: float,
-        live_obs_x: float,
-        live_obs_size: float,
-        uprightness: float = 1.0,
-    ) -> tuple[float, float, str]:
-        """Esquive arc linéaire : centralité × taille × tilt-recovery."""
-        live_x = float(np.clip(live_obs_x, -1.0, 1.0))
-        latched = float(np.clip(self._latched_obs_x, -1.0, 1.0))
-
-        centrality = 1.0 - live_x * live_x
-        size_factor = float(np.clip(live_obs_size / float(self.AVOID_SIZE_MED), 0.8, 1.5))
-        tilt_factor = float(np.clip(uprightness / 0.95, 0.3, 1.0))
-        dodge_mag = float(self.AVOID_TURN_MAX) * centrality * size_factor * tilt_factor
-
-        eps = float(self.AVOID_CENTER_EPS)
-        if abs(latched) > eps:
-            dodge_dir = -1.0 if latched > 0.0 else 1.0
-        elif abs(live_x) > eps and live_obs_size >= float(self.AVOID_SIZE_ON):
-            dodge_dir = -1.0 if live_x > 0.0 else 1.0
-        else:
-            if abs(target_bias) > 1e-9:
-                dodge_dir = 1.0 if target_bias > 0.0 else -1.0
-            else:
-                dodge_dir = 1.0
-
-        obstacle_bias = dodge_dir * dodge_mag
-        bias = obstacle_bias + float(self.AVOID_BANANA_BLEND) * float(target_bias)
-        bias = float(np.clip(bias, -float(self.VIS_TURN_MAX), float(self.VIS_TURN_MAX)))
-        base = float(self.BASE_DRIVE_FAST) * float(self.AVOID_SPEED_FRAC)
-        return bias, base, "ARC"
 
     # ------------------------------------------------------------------
     def compute_vision_debug_overlay(self, sim: MiniprojectSimulation):
