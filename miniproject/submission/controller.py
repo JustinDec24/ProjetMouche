@@ -122,15 +122,28 @@ class Controller:
     HEAD_COLLISION_COOLDOWN = 4
 
     # --- vision silhouette (Level 2) ---
+    # Test "ce qui dépasse de l'horizon" : un pixel sombre n'est compté comme
+    # silhouette de brin que si, dans la même colonne rétinienne au-dessus de
+    # lui, on trouve un ommatidium clair (= du ciel). Élimine les pixels
+    # sombres qui ne sont pas vraiment des obstacles (texture sol, fond, etc).
     VISION_ENABLE = True
     BLADE_DARK_THRESH = 0.20        # ommatidium sombre si sum_intensity < 0.20
-    BLADE_COUNT_URGENT = 45         # normalisation : obs_size = max(dL,dR)/URGENT
+    # Test "ciel au-dessus" en CONTRASTE relatif (pas en valeur absolue) :
+    # l'omm directement au-dessus doit être plus clair que ce candidat de
+    # VIS_SKY_CONTRAST_THRESH. Robuste aux variations de luminosité globale.
+    VIS_SKY_CONTRAST_THRESH = 0.15
+    VIS_SKY_ABOVE_COL_TOL_FRAC = 0.08  # tolérance colonne (8% largeur image)
+    BLADE_COUNT_URGENT = 18         # normalisation : obs_size = max(dL,dR)/URGENT
     VIS_EMA = 0.55                  # lissage des signaux
     VIS_STARTUP_DELAY_DECISIONS = 8
+    # Masque frontal : ommatidia qui regardent vraiment devant la mouche.
+    # Œil gauche : moitié droite de l'image (nasal) ; symétrique pour œil droit.
+    VIS_FRONTAL_FRAC = 0.40
+    VIS_UPPER_FRAC = 0.50           # moitié haute du champ (au-dessus horizon)
 
     # --- AVOID FSM (déclenchement / sortie) ---
-    AVOID_SIZE_ON = 0.45            # entre AVOID (≈ 20 px sombres)
-    AVOID_SIZE_OFF = 0.22           # sort AVOID (≈ 10 px)
+    AVOID_SIZE_ON = 0.50            # entre AVOID (~9 omms silhouettés)
+    AVOID_SIZE_OFF = 0.22           # sort AVOID (~4 omms)
     AVOID_SIZE_MED = 0.80           # "obstacle moyen" → dodge × 1.0
     AVOID_MIN_DURATION = 4
     AVOID_CLEAR_DECISIONS = 1
@@ -194,7 +207,10 @@ class Controller:
         # Vision state (silhouette → EMA(obs_size, obs_x))
         self._vis_obs_size = 0.0
         self._vis_obs_x = 0.0
-        self._upper_half_mask: np.ndarray | None = None
+        self._frontal_mask_left: np.ndarray | None = None
+        self._frontal_mask_right: np.ndarray | None = None
+        self._sky_above_idx: np.ndarray | None = None
+        self._sky_above_valid: np.ndarray | None = None
         self._vis_debug_overlay = None
 
         # AVOID FSM state
@@ -227,9 +243,22 @@ class Controller:
         if self._enable_grass:
             try:
                 retina = sim.world.fly_lookup[sim.fly.name].retina
-                self._upper_half_mask = self._compute_upper_half_mask(retina)
+                (
+                    self._frontal_mask_left,
+                    self._frontal_mask_right,
+                    self._sky_above_idx,
+                    self._sky_above_valid,
+                ) = self._compute_vision_masks(
+                    retina,
+                    upper_frac=float(self.VIS_UPPER_FRAC),
+                    frontal_frac=float(self.VIS_FRONTAL_FRAC),
+                    col_tol_frac=float(self.VIS_SKY_ABOVE_COL_TOL_FRAC),
+                )
             except Exception:
-                self._upper_half_mask = None
+                self._frontal_mask_left = None
+                self._frontal_mask_right = None
+                self._sky_above_idx = None
+                self._sky_above_valid = None
 
         try:
             self._banana_xy = np.asarray(sim.world.banana_xy, dtype=float)
@@ -589,7 +618,8 @@ class Controller:
         if (
             self.VISION_ENABLE
             and self._enable_grass
-            and self._upper_half_mask is not None
+            and self._frontal_mask_left is not None
+            and self._frontal_mask_right is not None
         ):
             obs_size, obs_x = self._vision_step(sim)
 
@@ -851,26 +881,76 @@ class Controller:
     # Vision : silhouette ommatidia → (obs_size, obs_x) EMA
     # ------------------------------------------------------------------
     @staticmethod
-    def _compute_upper_half_mask(retina) -> np.ndarray:
-        """Masque booléen des ommatidia situés dans la moitié haute du champ."""
-        ommatidia_id_map = np.asarray(retina.ommatidia_id_map)
-        nrows = ommatidia_id_map.shape[0]
-        n_omm = int(ommatidia_id_map.max())
-        row_per_omm = np.full(n_omm, nrows, dtype=float)
+    def _compute_vision_masks(
+        retina,
+        upper_frac: float,
+        frontal_frac: float,
+        col_tol_frac: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Précompute pour la vision silhouette.
+
+        Retourne (mask_left, mask_right, sky_above_idx, sky_above_valid) :
+          - mask_left/right : ommatidia frontaux-supérieurs par œil
+          - sky_above_idx[i] : indice de l'omm le plus proche au-DESSUS de
+            l'omm i dans la même colonne rétinienne (-1 si rien au-dessus)
+          - sky_above_valid[i] : True si sky_above_idx[i] est utilisable
+
+        Le test "sky-above" : un omm sombre est considéré comme silhouette de
+        brin seulement si l'omm pointé par sky_above_idx[i] est clair (= ciel).
+        Ça élimine les pixels sombres de texture sol/fond qui ne dépassent pas
+        au-dessus de l'horizon.
+        """
+        om_map = np.asarray(retina.ommatidia_id_map)
+        nrows, ncols = om_map.shape
+        n_omm = int(om_map.max())
+        rows = np.full(n_omm, float(nrows), dtype=float)
+        cols = np.full(n_omm, float(ncols), dtype=float)
         for i in range(1, n_omm + 1):
-            ys, _ = np.where(ommatidia_id_map == i)
+            ys, xs = np.where(om_map == i)
             if len(ys) > 0:
-                row_per_omm[i - 1] = float(ys.mean())
-        return row_per_omm < (nrows * 0.5)
+                rows[i - 1] = float(ys.mean())
+                cols[i - 1] = float(xs.mean())
+
+        upper = rows < (nrows * upper_frac)
+        # Œil gauche : nasal = côté droit de l'image (col haute)
+        left_nasal = cols > (1.0 - frontal_frac) * ncols
+        # Œil droit : nasal = côté gauche (col basse)
+        right_nasal = cols < frontal_frac * ncols
+        mask_left = upper & left_nasal
+        mask_right = upper & right_nasal
+
+        # Pour chaque omm, on cherche l'omm le plus proche AU-DESSUS dans la
+        # même colonne rétinienne (row < row_i, |col - col_i| <= col_tol).
+        col_tol = max(1.0, ncols * col_tol_frac)
+        # Calcul vectorisé : matrice des deltas
+        row_delta = rows[None, :] - rows[:, None]   # (n, n) : delta[i, j] = row_j - row_i
+        col_delta = np.abs(cols[None, :] - cols[:, None])
+        # j est candidat si : row_j < row_i (delta<0) ET même colonne
+        cand_mask = (row_delta < 0.0) & (col_delta <= col_tol)
+        # Pour chaque i, on veut le j candidat avec row_j le plus grand (=
+        # le plus proche au-dessus). On masque les non-candidats à -inf.
+        scores = np.where(cand_mask, rows[None, :], -np.inf)
+        np.fill_diagonal(scores, -np.inf)
+        sky_above_idx = np.argmax(scores, axis=1).astype(np.int64)
+        sky_above_valid = np.isfinite(scores[np.arange(n_omm), sky_above_idx])
+        # Quand invalide, on met 0 pour permettre l'indexation safe
+        sky_above_idx[~sky_above_valid] = 0
+        return mask_left, mask_right, sky_above_idx, sky_above_valid
 
     def _vision_step(self, sim) -> tuple[float, float]:
-        """Détecte silhouette de brin contre le ciel et produit (obs_size, obs_x).
+        """Détecte silhouettes (= dark + sky au-dessus) → (obs_size, obs_x).
 
-        - dL/dR = pixels sombres dans la moitié haute du champ visuel
+        - dL/dR = ommatidia frontaux-supérieurs sombres ET avec du ciel
+          au-dessus (= pixels qui dépassent vraiment de l'horizon)
         - obs_size = max(dL, dR) / BLADE_COUNT_URGENT, clipé [0, 1]
-        - obs_x = (dR - dL) / (dR + dL) ∈ [-1, +1] (négatif = obstacle à gauche)
+        - obs_x ∈ [-1, +1] : (dR - dL) / (dR + dL)
         """
-        if self._upper_half_mask is None:
+        if (
+            self._frontal_mask_left is None
+            or self._frontal_mask_right is None
+            or self._sky_above_idx is None
+            or self._sky_above_valid is None
+        ):
             return float(self._vis_obs_size), float(self._vis_obs_x)
 
         if self._debug_decisions < int(self.VIS_STARTUP_DELAY_DECISIONS):
@@ -881,15 +961,19 @@ class Controller:
         except Exception:
             return float(self._vis_obs_size), float(self._vis_obs_x)
 
-        sum_int = ommatidia.sum(axis=-1)
+        sum_int = ommatidia.sum(axis=-1)  # shape (2, n_omm)
         dark_mask = sum_int < float(self.BLADE_DARK_THRESH)
-        dL = int((dark_mask[0] & self._upper_half_mask).sum())
-        dR = int((dark_mask[1] & self._upper_half_mask).sum())
 
-        upper_total = int(self._upper_half_mask.sum())
-        if dL > upper_total * 0.7 and dR > upper_total * 0.7:
-            dL = 0
-            dR = 0
+        # Test sky-above en CONTRASTE : (sum_above - sum_self) > seuil
+        sum_int_above = sum_int[:, self._sky_above_idx]   # (2, n_omm)
+        contrast = sum_int_above - sum_int                # (2, n_omm)
+        sky_bright = (contrast > float(self.VIS_SKY_CONTRAST_THRESH)) & self._sky_above_valid[None, :]
+
+        # Silhouette = dark ET sky-above-bright
+        silhouette = dark_mask & sky_bright
+
+        dL = int((silhouette[0] & self._frontal_mask_left).sum())
+        dR = int((silhouette[1] & self._frontal_mask_right).sum())
 
         total_dark = dL + dR
         if total_dark < 1:
@@ -1019,8 +1103,14 @@ class Controller:
 
     # ------------------------------------------------------------------
     def compute_vision_debug_overlay(self, sim: MiniprojectSimulation):
-        """Overlay debug : silhouette dark-pixels en rouge sur le champ rétinal."""
-        if not self._enable_grass or self._upper_half_mask is None:
+        """Overlay debug : silhouette (dark + sky-above) en rouge sur le rétinal."""
+        if (
+            not self._enable_grass
+            or self._frontal_mask_left is None
+            or self._frontal_mask_right is None
+            or self._sky_above_idx is None
+            or self._sky_above_valid is None
+        ):
             return None
         try:
             ommatidia = sim.get_ommatidia_readouts(sim.fly.name)
@@ -1028,15 +1118,21 @@ class Controller:
         except Exception:
             return None
         sum_intensity = ommatidia.sum(axis=-1)
+        eye_masks = (self._frontal_mask_left, self._frontal_mask_right)
+        contrast_thresh = float(self.VIS_SKY_CONTRAST_THRESH)
         try:
             frames = []
             for eye_idx in range(2):
                 base = retina.hex_pxls_to_human_readable(sum_intensity[eye_idx])
                 base_norm = (np.clip(base / max(base.max(), 1e-6), 0, 1) * 255).astype(np.uint8)
                 rgb = np.stack([base_norm, base_norm, base_norm], axis=-1)
-                dark = (sum_intensity[eye_idx] < self.BLADE_DARK_THRESH) & self._upper_half_mask
-                if dark.any():
-                    mark_img = retina.hex_pxls_to_human_readable(dark.astype(np.float32))
+                si = sum_intensity[eye_idx]
+                dark = si < self.BLADE_DARK_THRESH
+                contrast = si[self._sky_above_idx] - si
+                sky_bright = (contrast > contrast_thresh) & self._sky_above_valid
+                silhouette = dark & sky_bright & eye_masks[eye_idx]
+                if silhouette.any():
+                    mark_img = retina.hex_pxls_to_human_readable(silhouette.astype(np.float32))
                     mask = mark_img > 0.1
                     rgb[mask, 0] = 255
                     rgb[mask, 1] = 0
