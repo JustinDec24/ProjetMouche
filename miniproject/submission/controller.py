@@ -143,8 +143,13 @@ class Controller:
     #   - il est vert
     #   - il existe au moins un pixel ciel à sa gauche dans la même ligne
     #   - et au moins un pixel ciel à sa droite dans la même ligne
-    VIS_GREEN_DELTA = 0.12          # G - R > delta ET G - B > delta (vert franc)
-    VIS_GREEN_MIN = 0.32            # G doit être > 0.32
+    VIS_GREEN_DELTA = 0.07          # G - R > delta ET G - B > delta
+    VIS_GREEN_MIN = 0.22            # G doit être > 0.22 (catches darker piques)
+    # Sky strict : bleu-dominant OU achromatique brillant. Évite que les
+    # zones tan/brun (transition horizon) soient classées comme sky.
+    VIS_SKY_BLUE_STRICT = 0.05      # B - max(R, G) > 0.05 → vrai bleu
+    VIS_SKY_WHITE_SPREAD = 0.10     # max-min < 0.10 → vraiment achromatique
+    VIS_SKY_WHITE_MIN_SUM = 1.50    # somme RGB > 1.50 pour le nuage blanc
     VIS_SKY_BLUE_MARGIN = 0.03      # B + margin >= R et B + margin >= G
     VIS_SKY_GREY_SPREAD_MAX = 0.18  # max(R,G,B) - min(R,G,B) < spread → achromatique
     VIS_SKY_MIN_SUM = 0.90          # somme RGB > 0.90
@@ -153,15 +158,16 @@ class Controller:
     #     très distants à peine visibles)
     #   - VIS_SPIKE_MIN_ASPECT : ratio h/w minimum → garde les structures
     #     VERTICALES (piques) et rejette les masses larges/horizontales (hills)
-    VIS_SPIKE_MIN_HEIGHT = 8        # strict : pique doit être assez haut
-    VIS_SPIKE_MIN_ASPECT = 1.5      # strict : franchement vertical
-    BLADE_COUNT_URGENT = 500
+    VIS_SPIKE_MIN_HEIGHT = 6        # blob doit s'étendre verticalement
+    VIS_SPIKE_MAX_WIDTH = 35        # largeur max ciel-borders (allow close blades)
+    BLADE_COUNT_URGENT = 400
     VIS_EMA = 0.55
     VIS_STARTUP_DELAY_DECISIONS = 8
-    # ROI élargie : on regarde plus de champ horizontal (0.70) ET un peu plus
-    # de hauteur (0.55). Le filtre aspect rejette les blobs d'horizon larges.
+    # ROI : on étend la zone verticale jusqu'à 0.75 pour capturer le CORPS des
+    # piques (pas juste la pointe). L'horizon-band est plate et large → rejetée
+    # par le filtre aspect-ratio. Frontal nasal à 0.70 reste assez large.
     VIS_FRONTAL_FRAC = 0.70
-    VIS_UPPER_FRAC = 0.55
+    VIS_UPPER_FRAC = 0.75
 
     # --- AVOID FSM (déclenchement / sortie) ---
     AVOID_SIZE_ON = 0.45            # entre AVOID (~180 px silhouette)
@@ -883,16 +889,17 @@ class Controller:
         b = eye_img01[..., 2]
         delta = float(self.VIS_GREEN_DELTA)
         gmin = float(self.VIS_GREEN_MIN)
-        bm = float(self.VIS_SKY_BLUE_MARGIN)
-        spread_max = float(self.VIS_SKY_GREY_SPREAD_MAX)
-        sky_min = float(self.VIS_SKY_MIN_SUM)
         is_green = ((g - r) > delta) & ((g - b) > delta) & (g > gmin)
+        # Sky strict : VRAI bleu (B - max(R, G) > margin) OU vraiment blanc/gris
+        # achromatique brillant. Élimine les tans/bruns du test sky.
+        blue_strict = (b - np.maximum(r, g)) > float(self.VIS_SKY_BLUE_STRICT)
         mx = np.maximum(np.maximum(r, g), b)
         mn = np.minimum(np.minimum(r, g), b)
-        blue_dom = (b + bm >= r) & (b + bm >= g)
-        low_sat = (mx - mn) < spread_max
         sum_int = r + g + b
-        is_sky = (blue_dom | low_sat) & (sum_int > sky_min) & (~is_green)
+        white_strict = ((mx - mn) < float(self.VIS_SKY_WHITE_SPREAD)) & (
+            sum_int > float(self.VIS_SKY_WHITE_MIN_SUM)
+        )
+        is_sky = (blue_strict | white_strict) & (~is_green)
         return is_green, is_sky
 
     def _eye_spike_mask(
@@ -920,22 +927,35 @@ class Controller:
         if roi.shape[0] < 2 or roi.shape[1] < 2:
             return None
         is_green, is_sky = self._color_masks(roi)
+        nrows, ncols = is_green.shape
         if not is_green.any():
             return np.zeros_like(is_green), (0, r1, c0, c1)
 
-        spike_mask = np.zeros_like(is_green)
+        # Étape 1 : per-row sky-borders. Un pixel green compte si il existe
+        # un pixel sky à <= K pixels à GAUCHE OU à DROITE dans sa ligne.
+        # OR (pas AND) pour capter les BORDS de piques larges/proches.
+        # → rejette le sol vert (aucun sky dans la même ligne pour le sol).
+        K = int(self.VIS_SPIKE_MAX_WIDTH)
+        cum = np.zeros((nrows, ncols + 1), dtype=np.int32)
+        cum[:, 1:] = np.cumsum(is_sky.astype(np.int32), axis=1)
+        c_idx = np.arange(ncols)
+        a_left = np.maximum(0, c_idx - K)
+        has_sky_left = (cum[:, c_idx] - cum[:, a_left]) > 0
+        b_right = np.minimum(ncols, c_idx + K + 1)
+        a_right = np.minimum(ncols, c_idx + 1)
+        has_sky_right = (cum[:, b_right] - cum[:, a_right]) > 0
+        candidate = is_green & (has_sky_left | has_sky_right)
+        if not candidate.any():
+            return np.zeros_like(is_green), (0, r1, c0, c1)
+
+        # Étape 2 : CC sur candidate + filtre par hauteur. Rejette les slivers
+        # horizontaux d'1 ligne (transitions horizon) qui auraient pu passer.
         min_h = int(self.VIS_SPIKE_MIN_HEIGHT)
-        min_aspect = float(self.VIS_SPIKE_MIN_ASPECT)
-
+        spike_mask = np.zeros_like(is_green)
         if _SCIPY_NDIMAGE is None:
-            # Fallback minimaliste sans scipy : sky directement au-dessus
-            # de chaque pixel vert. Pas de filtre de forme.
-            sky_above = np.zeros_like(is_green)
-            sky_above[1:] = is_sky[:-1]
-            spike_mask = is_green & sky_above
-            return spike_mask, (0, r1, c0, c1)
-
-        labels, n_blobs = _SCIPY_NDIMAGE.label(is_green)
+            # Fallback sans scipy : on garde candidate tel quel
+            return candidate, (0, r1, c0, c1)
+        labels, n_blobs = _SCIPY_NDIMAGE.label(candidate)
         if n_blobs == 0:
             return spike_mask, (0, r1, c0, c1)
         slices = _SCIPY_NDIMAGE.find_objects(labels)
@@ -944,21 +964,8 @@ class Controller:
                 continue
             r_sl, c_sl = sl
             hh = r_sl.stop - r_sl.start
-            ww = c_sl.stop - c_sl.start
             if hh < min_h:
                 continue
-            if hh / max(1, ww) < min_aspect:
-                continue
-            top_r = r_sl.start
-            # Si le blob touche le bord haut de la ROI, c'est un blade qui
-            # s'étend hors champ : on l'accepte sans vérifier le ciel au-dessus.
-            if top_r > 0:
-                top_row_mask = labels[top_r, c_sl] == i
-                cols_top = np.where(top_row_mask)[0] + c_sl.start
-                if cols_top.size == 0:
-                    continue
-                if not is_sky[top_r - 1, cols_top].any():
-                    continue
             spike_mask[r_sl, c_sl] |= (labels[r_sl, c_sl] == i)
         return spike_mask, (0, r1, c0, c1)
 
