@@ -160,7 +160,12 @@ class Controller:
     #     VERTICALES (piques) et rejette les masses larges/horizontales (hills)
     VIS_SPIKE_MIN_HEIGHT = 6        # blob doit s'étendre verticalement
     VIS_SPIKE_MAX_WIDTH = 35        # largeur max ciel-borders (allow close blades)
-    BLADE_COUNT_URGENT = 400
+    # Bande CENTRALE pour déclencher AVOID : on détecte tous les piques pour la
+    # direction (obs_x) mais on ne déclenche AVOID que si la zone DIRECTEMENT
+    # DEVANT la mouche est bloquée. Pour l'œil gauche, le frontal pur = côté
+    # nasal = bord DROIT de la ROI. Symétrique pour œil droit.
+    VIS_CENTRAL_FRAC = 0.22         # ~22% nasal-most de la ROI par œil
+    BLADE_COUNT_URGENT = 600        # count central élevé → trigger seulement sur gros blocker
     VIS_EMA = 0.55
     VIS_STARTUP_DELAY_DECISIONS = 8
     # ROI : on étend la zone verticale jusqu'à 0.75 pour capturer le CORPS des
@@ -170,9 +175,18 @@ class Controller:
     VIS_UPPER_FRAC = 0.75
 
     # --- AVOID FSM (déclenchement / sortie) ---
-    AVOID_SIZE_ON = 0.45            # entre AVOID (~180 px silhouette)
-    AVOID_SIZE_OFF = 0.20           # sort AVOID (~80 px)
-    AVOID_SIZE_MED = 0.75           # "obstacle moyen" → dodge × 1.0
+    # AVOID FSM désactivé (seuil très haut) — remplacé par champ de répulsion
+    # continu en addition au target_bias dans _compute_drives. Le champ donne
+    # un steering progressif qui trouve les gaps dans une forêt dense, là où
+    # le AVOID arc-dodge oscillait.
+    AVOID_SIZE_ON = 2.0
+    AVOID_SIZE_OFF = 1.5
+    AVOID_SIZE_MED = 0.85
+
+    # Champ de répulsion : bias += REPULSION_GAIN × (-obs_x) × obs_size
+    # obs_x négatif = piques à gauche → bias positif → steer droite.
+    # obs_size = magnitude (forte si gros piques en face).
+    REPULSION_GAIN = 2.5
     AVOID_MIN_DURATION = 4
     AVOID_CLEAR_DECISIONS = 1
     AVOID_DISABLE_CLOSE_DIST = 8.0  # < 8 m banane : on fonce
@@ -625,7 +639,13 @@ class Controller:
         if self.VISION_ENABLE and self._enable_grass:
             obs_size, obs_x = self._vision_step(sim)
 
-        # ---- AVOID FSM ----
+        # ---- Champ de répulsion (= remplace AVOID FSM) ----
+        # bias = target_bias + REPULSION_GAIN * (-obs_x) * obs_size
+        # obs_x négatif (piques à gauche) → bias positif → steer droite.
+        # obs_size = magnitude scalaire (proximité). AVOID FSM seuil tellement
+        # haut qu'il ne se déclenche jamais ; on garde le code pour le debug
+        # mais en pratique on est toujours en GO + repulsion.
+        repulsion = float(self.REPULSION_GAIN) * (-obs_x) * obs_size
         self._update_avoid_state(obs_size, obs_x)
 
         if self._avoid_left > 0:
@@ -637,7 +657,7 @@ class Controller:
                 target_bias, obs_x, obs_size, _upright
             )
         else:
-            bias = float(target_bias)
+            bias = float(target_bias) + repulsion
             base_drive = float(self.BASE_DRIVE_FAST)
             sub_mode = "GO"
 
@@ -969,13 +989,34 @@ class Controller:
             spike_mask[r_sl, c_sl] |= (labels[r_sl, c_sl] == i)
         return spike_mask, (0, r1, c0, c1)
 
-    def _eye_spike_count(
+    def _eye_spike_counts(
         self, eye_img: np.ndarray, is_left_eye: bool
-    ) -> int:
+    ) -> tuple[int, int]:
+        """Retourne (total_count, central_count).
+
+        - total : tous les spike pixels dans la ROI (utilisé pour obs_x direction)
+        - central : seuls les spike pixels dans la bande centrale FRONTALE de la
+          ROI (= directement devant la mouche). Utilisé pour déclencher AVOID.
+        """
         result = self._eye_spike_mask(eye_img, is_left_eye)
         if result is None:
-            return 0
-        return int(result[0].sum())
+            return 0, 0
+        mask = result[0]
+        if mask.size == 0:
+            return 0, 0
+        total = int(mask.sum())
+        w_roi = mask.shape[1]
+        cf = float(self.VIS_CENTRAL_FRAC)
+        central_w = max(1, int(w_roi * cf))
+        if is_left_eye:
+            # ROI de l'œil gauche couvre cols [(1-frontal_frac)*W .. W].
+            # Le côté nasal (forward-looking) = cols hautes = bord DROIT de la ROI.
+            central_mask = mask[:, -central_w:]
+        else:
+            # Œil droit : nasal = bord GAUCHE de la ROI.
+            central_mask = mask[:, :central_w]
+        central = int(central_mask.sum())
+        return total, central
 
     def _vision_step(self, sim) -> tuple[float, float]:
         """Sky-vert-sky sur image RGB brute → (obs_size, obs_x).
@@ -995,18 +1036,20 @@ class Controller:
         if frames is None or len(frames) == 0:
             return float(self._vis_obs_size), float(self._vis_obs_x)
 
-        dL = self._eye_spike_count(frames[0], is_left_eye=True)
-        dR = self._eye_spike_count(
+        tot_L, _ = self._eye_spike_counts(frames[0], is_left_eye=True)
+        tot_R, _ = self._eye_spike_counts(
             frames[1] if len(frames) > 1 else frames[0], is_left_eye=False
         )
-
-        total_dark = dL + dR
-        if total_dark < 1:
+        # Pour le champ de répulsion :
+        # - obs_size = magnitude totale (proximité × nombre de piques)
+        # - obs_x    = position angulaire moyenne des piques en frame body
+        total_full = tot_L + tot_R
+        if total_full < 1:
             size_raw = 0.0
             x_raw = 0.0
         else:
-            size_raw = min(1.0, max(dL, dR) / float(self.BLADE_COUNT_URGENT))
-            x_raw = float(dR - dL) / float(total_dark)
+            size_raw = min(1.0, total_full / float(self.BLADE_COUNT_URGENT))
+            x_raw = float(tot_R - tot_L) / float(total_full)
 
         ema = float(self.VIS_EMA)
         self._vis_obs_size = ema * self._vis_obs_size + (1.0 - ema) * size_raw
@@ -1145,22 +1188,48 @@ class Controller:
             if a.max() > 1.5:
                 a = a / 255.0
             h, w = a.shape[:2]
-            result = self._eye_spike_mask(frames[eye_idx], is_left_eye=(eye_idx == 0))
+            is_left_eye = (eye_idx == 0)
+            result = self._eye_spike_mask(frames[eye_idx], is_left_eye)
             if result is None:
                 continue
             spike, (r0, r1, c0, c1) = result
-            # Image de visualisation (assombrie globalement, ROI normale)
+            # Masque central (= déclenche AVOID) vs périphérique (info seule)
+            w_roi = spike.shape[1]
+            cf = float(self.VIS_CENTRAL_FRAC)
+            central_w = max(1, int(w_roi * cf))
+            central_band = np.zeros_like(spike)
+            if is_left_eye:
+                central_band[:, -central_w:] = True
+            else:
+                central_band[:, :central_w] = True
+            spike_central = spike & central_band
+            spike_periph = spike & ~central_band
+
             base = (a * 0.55 * 255.0).astype(np.uint8)
             roi_view = base[r0:r1, c0:c1].copy()
-            roi_view[spike] = [255, 0, 0]
+            # Rouge plein = central (déclenche AVOID)
+            roi_view[spike_central] = [255, 0, 0]
+            # Orange = périphérique (info seule, donne obs_x)
+            roi_view[spike_periph] = [255, 165, 0]
             base[r0:r1, c0:c1] = roi_view
             cyan = np.array([0, 220, 220], dtype=np.uint8)
+            magenta = np.array([220, 0, 220], dtype=np.uint8)
             base[r0:r0 + 1, c0:c1] = cyan
             if r1 - 1 < h:
                 base[r1 - 1:r1, c0:c1] = cyan
             base[r0:r1, c0:c0 + 1] = cyan
             if c1 - 1 < w:
                 base[r0:r1, c1 - 1:c1] = cyan
+            # Cadre magenta autour de la bande centrale (= zone "in path")
+            if is_left_eye:
+                cc0 = c1 - central_w
+                cc1 = c1
+            else:
+                cc0 = c0
+                cc1 = c0 + central_w
+            base[r0:r1, cc0:cc0 + 1] = magenta
+            if cc1 - 1 < w:
+                base[r0:r1, cc1 - 1:cc1] = magenta
             outputs.append(base)
         if not outputs:
             return None
