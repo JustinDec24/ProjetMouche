@@ -15,6 +15,11 @@ from __future__ import annotations
 
 import numpy as np
 
+try:
+    from scipy import ndimage as _SCIPY_NDIMAGE
+except ImportError:
+    _SCIPY_NDIMAGE = None
+
 from miniproject.simulation import MiniprojectSimulation
 
 
@@ -143,16 +148,22 @@ class Controller:
     VIS_SKY_BLUE_MARGIN = 0.03      # B + margin >= R et B + margin >= G
     VIS_SKY_GREY_SPREAD_MAX = 0.18  # max(R,G,B) - min(R,G,B) < spread → achromatique
     VIS_SKY_MIN_SUM = 0.90          # somme RGB > 0.90
-    # Largeur max d'un "pique" en pixels : pour qu'un pixel vert compte, il
-    # faut du ciel à <= VIS_SPIKE_MAX_WIDTH pixels à gauche ET à droite dans
-    # sa ligne. Filtre les hills/masses vertes larges.
-    VIS_SPIKE_MAX_WIDTH = 18
-    BLADE_COUNT_URGENT = 400        # ~400 px = brin frontal proche bien visible
+    # Filtre de forme par composante connexe (style spike-ciel) :
+    #   - VIS_SPIKE_MIN_HEIGHT : rejette les petites composantes (bruit, piques
+    #     très distants à peine visibles)
+    #   - VIS_SPIKE_MIN_ASPECT : ratio h/w minimum → garde les structures
+    #     VERTICALES (piques) et rejette les masses larges/horizontales (hills)
+    VIS_SPIKE_MIN_HEIGHT = 5
+    VIS_SPIKE_MIN_ASPECT = 1.2
+    BLADE_COUNT_URGENT = 350        # ~350 px = brin frontal proche bien visible
     VIS_EMA = 0.55
     VIS_STARTUP_DELAY_DECISIONS = 8
-    # ROI : portion frontale-haute de l'image rétinienne par œil.
-    VIS_FRONTAL_FRAC = 0.55         # fraction nasale par œil (cols)
-    VIS_UPPER_FRAC = 0.55           # fraction haute (rows)
+    # ROI : portion frontale + au-dessus de l'horizon par œil. On reste assez
+    # haut (0.45) pour que la ligne d'horizon ne tombe pas dans la ROI : sinon
+    # les blobs de brin se mélangent avec la bande horizon et ratent le filtre
+    # aspect ratio.
+    VIS_FRONTAL_FRAC = 0.55
+    VIS_UPPER_FRAC = 0.45
 
     # --- AVOID FSM (déclenchement / sortie) ---
     AVOID_SIZE_ON = 0.45            # entre AVOID (~180 px silhouette)
@@ -886,17 +897,21 @@ class Controller:
         is_sky = (blue_dom | low_sat) & (sum_int > sky_min) & (~is_green)
         return is_green, is_sky
 
-    def _eye_spike_count(
+    def _eye_spike_mask(
         self, eye_img: np.ndarray, is_left_eye: bool
-    ) -> int:
-        """Compte les pixels silhouette (sky-vert-sky) dans la ROI nasale-haute."""
+    ) -> "tuple[np.ndarray, tuple[int, int, int, int]] | None":
+        """Retourne (spike_mask, (r0, r1, c0, c1)) ou None.
+
+        spike_mask : bool (h_roi, w_roi). True = pixel appartenant à un blob
+        green valide (TALL et VERTICAL — aspect h/w >= MIN_ASPECT) avec du
+        ciel directement au-dessus du sommet du blob.
+        """
         a = np.asarray(eye_img, dtype=np.float32)
         if a.ndim != 3 or a.shape[-1] < 3:
-            return 0
+            return None
         if a.max() > 1.5:
             a = a / 255.0
         h, w = a.shape[:2]
-        # ROI : moitié haute, moitié nasale par œil
         r1 = int(h * float(self.VIS_UPPER_FRAC))
         frontal = float(self.VIS_FRONTAL_FRAC)
         if is_left_eye:
@@ -905,26 +920,57 @@ class Controller:
             c0, c1 = 0, int(w * frontal)
         roi = a[0:r1, c0:c1, :3]
         if roi.shape[0] < 2 or roi.shape[1] < 2:
-            return 0
+            return None
         is_green, is_sky = self._color_masks(roi)
-        # Test "pique étroit" : un pixel vert compte si il existe un pixel sky
-        # à <= K pixels à GAUCHE ET à DROITE dans sa ligne. K petit → filtre
-        # les masses vertes larges (hills) tout en gardant les brins étroits.
-        K = int(self.VIS_SPIKE_MAX_WIDTH)
-        nrows, ncols = is_sky.shape
-        # cum[:, c] = nombre de sky pixels dans la ligne aux colonnes 0..c-1
-        cum = np.zeros((nrows, ncols + 1), dtype=np.int32)
-        cum[:, 1:] = np.cumsum(is_sky.astype(np.int32), axis=1)
-        c_idx = np.arange(ncols)
-        # Fenêtre gauche [c-K, c-1] : count = cum[c] - cum[max(0, c-K)]
-        a_left = np.maximum(0, c_idx - K)
-        has_sky_left = (cum[:, c_idx] - cum[:, a_left]) > 0
-        # Fenêtre droite [c+1, c+K] : count = cum[min(W, c+K+1)] - cum[c+1]
-        b_right = np.minimum(ncols, c_idx + K + 1)
-        a_right = np.minimum(ncols, c_idx + 1)
-        has_sky_right = (cum[:, b_right] - cum[:, a_right]) > 0
-        spike = is_green & has_sky_left & has_sky_right
-        return int(spike.sum())
+        if not is_green.any():
+            return np.zeros_like(is_green), (0, r1, c0, c1)
+
+        spike_mask = np.zeros_like(is_green)
+        min_h = int(self.VIS_SPIKE_MIN_HEIGHT)
+        min_aspect = float(self.VIS_SPIKE_MIN_ASPECT)
+
+        if _SCIPY_NDIMAGE is None:
+            # Fallback minimaliste sans scipy : sky directement au-dessus
+            # de chaque pixel vert. Pas de filtre de forme.
+            sky_above = np.zeros_like(is_green)
+            sky_above[1:] = is_sky[:-1]
+            spike_mask = is_green & sky_above
+            return spike_mask, (0, r1, c0, c1)
+
+        labels, n_blobs = _SCIPY_NDIMAGE.label(is_green)
+        if n_blobs == 0:
+            return spike_mask, (0, r1, c0, c1)
+        slices = _SCIPY_NDIMAGE.find_objects(labels)
+        for i, sl in enumerate(slices, start=1):
+            if sl is None:
+                continue
+            r_sl, c_sl = sl
+            hh = r_sl.stop - r_sl.start
+            ww = c_sl.stop - c_sl.start
+            if hh < min_h:
+                continue
+            if hh / max(1, ww) < min_aspect:
+                continue
+            top_r = r_sl.start
+            # Si le blob touche le bord haut de la ROI, c'est un blade qui
+            # s'étend hors champ : on l'accepte sans vérifier le ciel au-dessus.
+            if top_r > 0:
+                top_row_mask = labels[top_r, c_sl] == i
+                cols_top = np.where(top_row_mask)[0] + c_sl.start
+                if cols_top.size == 0:
+                    continue
+                if not is_sky[top_r - 1, cols_top].any():
+                    continue
+            spike_mask[r_sl, c_sl] |= (labels[r_sl, c_sl] == i)
+        return spike_mask, (0, r1, c0, c1)
+
+    def _eye_spike_count(
+        self, eye_img: np.ndarray, is_left_eye: bool
+    ) -> int:
+        result = self._eye_spike_mask(eye_img, is_left_eye)
+        if result is None:
+            return 0
+        return int(result[0].sum())
 
     def _vision_step(self, sim) -> tuple[float, float]:
         """Sky-vert-sky sur image RGB brute → (obs_size, obs_x).
@@ -1094,38 +1140,22 @@ class Controller:
             if a.max() > 1.5:
                 a = a / 255.0
             h, w = a.shape[:2]
-            r1 = int(h * float(self.VIS_UPPER_FRAC))
-            frontal = float(self.VIS_FRONTAL_FRAC)
-            if eye_idx == 0:
-                c0, c1 = int(w * (1.0 - frontal)), w
-            else:
-                c0, c1 = 0, int(w * frontal)
-            roi = a[0:r1, c0:c1, :3]
-            is_green, is_sky = self._color_masks(roi)
-            K = int(self.VIS_SPIKE_MAX_WIDTH)
-            nrows, ncols = is_sky.shape
-            cum = np.zeros((nrows, ncols + 1), dtype=np.int32)
-            cum[:, 1:] = np.cumsum(is_sky.astype(np.int32), axis=1)
-            c_idx = np.arange(ncols)
-            a_left = np.maximum(0, c_idx - K)
-            has_sky_left = (cum[:, c_idx] - cum[:, a_left]) > 0
-            b_right = np.minimum(ncols, c_idx + K + 1)
-            a_right = np.minimum(ncols, c_idx + 1)
-            has_sky_right = (cum[:, b_right] - cum[:, a_right]) > 0
-            spike = is_green & has_sky_left & has_sky_right
-            # Image de visualisation (assombrie hors ROI, ROI mise en couleur)
+            result = self._eye_spike_mask(frames[eye_idx], is_left_eye=(eye_idx == 0))
+            if result is None:
+                continue
+            spike, (r0, r1, c0, c1) = result
+            # Image de visualisation (assombrie globalement, ROI normale)
             base = (a * 0.55 * 255.0).astype(np.uint8)
-            roi_view = base[0:r1, c0:c1].copy()
+            roi_view = base[r0:r1, c0:c1].copy()
             roi_view[spike] = [255, 0, 0]
-            base[0:r1, c0:c1] = roi_view
-            # cadre cyan autour de la ROI
+            base[r0:r1, c0:c1] = roi_view
             cyan = np.array([0, 220, 220], dtype=np.uint8)
-            base[0:1, c0:c1] = cyan
+            base[r0:r0 + 1, c0:c1] = cyan
             if r1 - 1 < h:
                 base[r1 - 1:r1, c0:c1] = cyan
-            base[0:r1, c0:c0 + 1] = cyan
+            base[r0:r1, c0:c0 + 1] = cyan
             if c1 - 1 < w:
-                base[0:r1, c1 - 1:c1] = cyan
+                base[r0:r1, c1 - 1:c1] = cyan
             outputs.append(base)
         if not outputs:
             return None
