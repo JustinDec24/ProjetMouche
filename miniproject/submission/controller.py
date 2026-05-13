@@ -168,6 +168,12 @@ class Controller:
     HEAD_COLLISION_PIVOT_MIN = 0.25
     HEAD_COLLISION_ARC_OUTER = 2.0               # roue extérieure de l'arc
     HEAD_COLLISION_ARC_INNER = 0.6               # roue intérieure de l'arc
+    # Pose naturelle préservée : on n'écrase PAS toutes les articulations.
+    # On applique uniquement un OFFSET (additif au CPG) sur le coxa-pitch
+    # des pattes avant pour les lever juste assez à décrocher du pic.
+    # Femur/tibia restent contrôlés par le CPG → allure naturelle.
+    HEAD_COLLISION_FRONT_TUCK_DECISIONS = 15      # durée du lift (~250 ms)
+    HEAD_COLLISION_FRONT_LIFT_COXA_OFFSET = -0.5   # offset coxa-pitch (+1) : lève la patte
 
     # --- GO mode pivot (réalignement continu) ---
     # En GO (pas d'obstacle), si la mouche est mal alignée avec la banane,
@@ -279,6 +285,18 @@ class Controller:
         self._step_count += 1
 
         joint_angles, adhesion = self.turning_controller.step(self._drives)
+
+        # --- Front legs lift au tout début du BACKUP head-collision ---
+        # Offset additif sur la coxa-pitch des pattes avant pour les lever
+        # juste assez à décrocher du pic. Femur/tibia restent CPG → allure
+        # naturelle. Actif seulement les N premières décisions du BACKUP.
+        tuck_threshold = int(self.HEAD_COLLISION_BACKUP_DECISIONS) - int(
+            self.HEAD_COLLISION_FRONT_TUCK_DECISIONS
+        )
+        if self._collision_phase == 1 and self._collision_left > tuck_threshold:
+            for li in (0, 3):
+                base = li * 7
+                joint_angles[base + 1] += float(self.HEAD_COLLISION_FRONT_LIFT_COXA_OFFSET)
 
         # --- Active roll compensation ---
         if self.TILT_LEAN_ENABLE:
