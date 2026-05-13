@@ -75,10 +75,10 @@ class Controller:
 
     # --- grip boost ---
     TERRAIN_GRIP_FORCE = 6.0    # bumped 4.0→6.0 : évite que la mouche tombe sur le côté
-    WIND_GRIP_FORCE = 10.0
+    WIND_GRIP_FORCE = 25.0     # L3/L4 : grip très fort pour ne pas se faire souffler
     # Grip max sur toutes les pattes pendant les N premiers SIM STEPS (pas
     # décisions), pour stabiliser la mouche dès le spawn sur le terrain.
-    STARTUP_MAX_GRIP_STEPS = 1500   # ~0.15 s @ timestep 1e-4
+    STARTUP_MAX_GRIP_STEPS = 3000   # ~0.15 s @ timestep 1e-4
 
     # --- orientation safety ---
     TERRAIN_UPRIGHT_TILT_WARN = 0.35    # plus permissif (~ 70° au lieu de ~60°)
@@ -105,15 +105,15 @@ class Controller:
     VIS_ROI_C0_RIGHT = 0.02
     VIS_ROI_C1_RIGHT = 0.45
 
-    # EMA pour stabilité du signal
-    VIS_EMA = 0.55
+    # EMA pour stabilité du signal (bas = lissage plus fort, anti-wind sway)
+    VIS_EMA = 0.30
 
     # --- Edge-based detection (vertical edge pairing) ---
     # Un pique = 2 arêtes verticales parallèles séparées de quelques pixels.
     # Robuste : pas de seuil couleur, juste géométrie. Les collines ont des
     # arêtes horizontales → exclues. Les pics ont des arêtes verticales.
     VIS_EDGE_MAGNITUDE_THRESHOLD = 0.08    # seuil de force d'arête
-    VIS_EDGE_VERTICALITY_THRESHOLD = 0.30  # |gx|/(|gx|+|gy|) > seuil = vertical
+    VIS_EDGE_VERTICALITY_THRESHOLD = 0.20  # |gx|/(|gx|+|gy|) > seuil = vertical (tolère pics penchés par vent)
     VIS_EDGE_MIN_DENSITY = 0.8            # densité par colonne (haut = filtre les piques lointains)
     VIS_EDGE_MIN_SPIKE_WIDTH = 0           # largeur min entre 2 arêtes paires
     VIS_EDGE_MAX_SPIKE_WIDTH = 30          # largeur max entre 2 arêtes paires
@@ -122,8 +122,8 @@ class Controller:
     # Complète le pairing d'arêtes : un pique très proche ou qui sort du cadre
     # n'a pas de paire d'arêtes (centre uniforme vert OU 1 seul bord visible).
     # Une colonne saturée de vert = pique massif/proche.
-    VIS_GREEN_SOLID_THRESHOLD = 0.72       # fraction de colonne en vert (haut = filtre piques lointains)
-    VIS_GREEN_DELTA = 0.04                 # g > r+delta ET g > b+delta = vert
+    VIS_GREEN_SOLID_THRESHOLD = 0.60       # fraction de colonne en vert (compense oscillations vent)
+    VIS_GREEN_DELTA = 0.025                # g > r+delta ET g > b+delta = vert (tolère ombrage vent)
 
     # --- Steering : seuil de proximité banane (sprint final) ---
     AVOID_DISABLE_CLOSE_DIST = 8.0  # < 8 m de la banane : on fonce sans répulsion
