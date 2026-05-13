@@ -46,7 +46,8 @@ class Controller:
     PALP_WEIGHT = 9
     ANTENNA_WEIGHT = 1
     EPS_ODOR = 1e-12
-    STOP_ODOR_THRESHOLD = 5e-4
+    STOP_ODOR_THRESHOLD = 5e-3      # 10x plus permissif : laisse la mouche
+                                     # s'approcher jusqu'à STOP_DIST physique
     STOP_DIST = 2.0
 
     # --- drives ---
@@ -58,7 +59,8 @@ class Controller:
     MIN_SIDE_DRIVE = 0.40
     MIN_SIDE_DRIVE_TERRAIN = 0.25
     TURN_MOD = 0.8
-    AVOID_TURN_MOD = 1.0  # plein différentiel pendant AVOID
+    AVOID_TURN_MOD = 1.0      # plein différentiel pendant AVOID (flat)
+    AVOID_TURN_MOD_TERRAIN = 0.55  # softer sur terrain (évite flip)
 
     # --- target steering (cap banane) ---
     TARGET_STEER_GAIN = 3.0
@@ -96,10 +98,10 @@ class Controller:
     WIND_GRIP_FORCE = 10.0
 
     # --- orientation safety ---
-    TERRAIN_UPRIGHT_TILT_WARN = 0.48
-    TERRAIN_TILT_RESET_HOLD = 26
+    TERRAIN_UPRIGHT_TILT_WARN = 0.35    # plus permissif (~ 70° au lieu de ~60°)
+    TERRAIN_TILT_RESET_HOLD = 80        # ~2s : laisse + de temps pour récup
     TERRAIN_FLIP_WEAK_UPRIGHT = 0.12
-    TERRAIN_FLIP_RESET_HOLD = 34
+    TERRAIN_FLIP_RESET_HOLD = 60        # ~1.5s pour flip total
 
     # --- jam reflex (anti-stuck, non-visuel) ---
     JAM_ENABLE = True
@@ -155,6 +157,11 @@ class Controller:
     VIS_SPIKE_MIN_AREA_PX = 1600
     VIS_SPIKE_MIN_HEIGHT_PX = 40
     VIS_SPIKE_MIN_ASPECT = 1.2
+    # Exemption du filtre aspect pour les très gros blobs (= pique très
+    # proche qui remplit l'écran). Au-delà de cette aire, on garde même
+    # si l'aspect ratio est < MIN_ASPECT. Évite que la mouche fonce dans
+    # un mur vert qu'elle ne détecte pas car "trop large".
+    VIS_SPIKE_LARGE_OVERRIDE_PX = 5000
 
     # EMA pour stabilité du signal
     VIS_EMA = 0.55
@@ -180,7 +187,7 @@ class Controller:
     VIS_TURN_MAX = 3.0
 
     # Vitesse pendant AVOID (fraction de BASE_DRIVE_FAST)
-    AVOID_SPEED_FRAC = 0.60   # ralenti 0.65→0.60
+    AVOID_SPEED_FRAC = 0.60
 
     # --- GO sweep (balayage gauche-droite pour détecter le frontal) ---
     # Pendant GO la mouche oscille latéralement : son champ visuel balaye
@@ -345,15 +352,19 @@ class Controller:
             except Exception:
                 uprightness = 1.0
 
+            # Log uprightness toutes les 5 décisions pour diagnostic
+            if self._debug_decisions % 5 == 0:
+                print(f"[UP d={self._debug_decisions}] upright={uprightness:.2f}", flush=True)
+
             if uprightness < float(self.TERRAIN_UPRIGHT_TILT_WARN):
                 self._tilt_decisions += 1
             else:
                 self._tilt_decisions = 0
 
+            # JAMAIS de stop permanent sur tilt non plus. La mouche peut
+            # rester tiltée longtemps (sur pente) sans être vraiment KO.
             if self._tilt_decisions >= int(self.TERRAIN_TILT_RESET_HOLD):
-                self._stopped = True
-                self._tilt_decisions = 0
-                return np.zeros_like(joint_angles), np.zeros_like(adhesion)
+                self._tilt_decisions = 0  # juste reset le compteur
 
         # --- Grip control (terrain) ---
         if self._enable_terrain and is_decision_step:
@@ -361,16 +372,11 @@ class Controller:
                 adhesion = np.zeros_like(adhesion)
                 return joint_angles, adhesion
 
-            if uprightness < -0.4:
-                self._flip_decisions = 999
-            elif uprightness < float(self.TERRAIN_FLIP_WEAK_UPRIGHT):
-                self._flip_decisions += 1
-            else:
-                self._flip_decisions = 0
-
-            if self._flip_decisions >= int(self.TERRAIN_FLIP_RESET_HOLD):
-                self._stopped = True
-                return np.zeros_like(joint_angles), np.zeros_like(adhesion)
+            # JAMAIS de stop permanent sur flip. Si renversée, on freeze
+            # les drives jusqu'à récupération naturelle (slide sur pente).
+            # La mouche peut souvent ressortir d'un flip après quelques secondes.
+            if uprightness < 0.0:
+                return joint_angles, np.zeros_like(adhesion)
 
             in_avoid = self._avoid_left > 0
             grip_val = (
@@ -603,6 +609,7 @@ class Controller:
         odor_r = self.PALP_WEIGHT * float(rp) + self.ANTENNA_WEIGHT * float(ra)
         mean_odor = 0.5 * (odor_l + odor_r)
         if mean_odor > self.STOP_ODOR_THRESHOLD:
+            print(f"[STOP REASON] ODOR d={self._debug_decisions} mean_odor={mean_odor:.3e} dist={dist_to_banana:.2f}", flush=True)
             self._stopped = True
             return np.array([0.0, 0.0])
 
@@ -706,7 +713,15 @@ class Controller:
             turn_mod = turn_mod / (1.0 + self.TURN_STEEP_GAIN * max(0.0, slope_mag))
 
         if self._avoid_left > 0:
-            turn_mod = float(self.AVOID_TURN_MOD)
+            if self._enable_terrain:
+                # Size-adaptive : pique loin → tourne doux (évite flip sur pente).
+                # Pique proche/gros → tourne fort (urgence).
+                _t_close = float(np.clip(obs_size / float(self.AVOID_SIZE_MED), 0.0, 1.0))
+                turn_mod = float(self.AVOID_TURN_MOD_TERRAIN) + (
+                    float(self.AVOID_TURN_MOD) - float(self.AVOID_TURN_MOD_TERRAIN)
+                ) * _t_close
+            else:
+                turn_mod = float(self.AVOID_TURN_MOD)
 
         # ---- tanh + asymétrie roues ----
         bias_norm = float(np.tanh(bias))
@@ -727,6 +742,19 @@ class Controller:
             _slope_blend = 0.50 * float(np.clip((slope_mag - 0.20) / 0.20, 0.0, 1.0))
             _mean_d = float(np.mean(drives))
             drives = drives * (1.0 - _slope_blend) + _mean_d * _slope_blend
+            drives = np.clip(drives, 0.0, max_drive)
+
+        # TILT-adaptive : si la mouche tilte (uprightness < 0.7), blend
+        # vers drives symétriques pour éviter le flip. Plus forte que slope.
+        try:
+            xmat_t = sim.mj_data.xmat[self._thorax_body_id].reshape(3, 3)
+            tilt_up = float(xmat_t[2, 2])
+        except Exception:
+            tilt_up = 1.0
+        if tilt_up < 0.70:
+            tilt_blend = min(0.90, (0.70 - tilt_up) / 0.50)
+            _mean_d = float(np.mean(drives))
+            drives = drives * (1.0 - tilt_blend) + _mean_d * tilt_blend
             drives = np.clip(drives, 0.0, max_drive)
 
         if (
@@ -786,17 +814,11 @@ class Controller:
         if len(self._dist_history) > int(self.NOPROG_WINDOW):
             self._dist_history.pop(0)
 
-        # Alarme roll (mouche penche fortement sans tomber)
-        try:
-            xmat_pre = sim.mj_data.xmat[self._thorax_body_id].reshape(3, 3)
-            roll_pre = float(xmat_pre[2, 1])
-            upright_pre = float(xmat_pre[2, 2])
-        except Exception:
-            roll_pre, upright_pre = 0.0, 1.0
-        roll_alarm = (
-            abs(roll_pre) > float(self.ROLL_TRIGGER_THRESH)
-            and upright_pre > float(self.TERRAIN_FLIP_WEAK_UPRIGHT)
-        )
+        # Alarme roll : DÉSACTIVÉE complètement. Sur les pentes elle
+        # déclenchait à tort → SIDESTEP backup+turn agressif → flip.
+        # On utilise UNIQUEMENT le trigger no-progress (basé distance).
+        roll_pre, upright_pre = 0.0, 1.0
+        roll_alarm = False
         if roll_alarm:
             self._roll_high_count += 1
         else:
@@ -1063,13 +1085,58 @@ class Controller:
                     bad[i] = True
                     continue
                 if min_aspect > 0.0 and bb_w > 0:
-                    aspect = bb_h / float(bb_w)
-                    if aspect < min_aspect:
-                        bad[i] = True
+                    # Exemption SPÉCIFIQUE : très gros blob ET son top est
+                    # collé au sommet de la ROI (= silhouette qui dépasse
+                    # au-dessus du champ visible = vrai pique très proche).
+                    # Distingue d'un hill/sol-bump (top visible dans ROI).
+                    extends_above_view = (row_sl.start == 0)
+                    is_huge = int(counts[i]) >= int(self.VIS_SPIKE_LARGE_OVERRIDE_PX)
+                    if not (is_huge and extends_above_view):
+                        aspect = bb_h / float(bb_w)
+                        if aspect < min_aspect:
+                            bad[i] = True
         return m & ~bad[lbl]
 
+    def _scan_spike_mask_panorama(self, panorama_rgb: np.ndarray) -> np.ndarray:
+        """Détecte sky-blade-sky sur le panorama RGB CONCATÉNÉ (les 2 yeux).
+
+        Évite le bug "obstacle frontal dans angle mort binoculaire" : quand
+        un pique pile-en-face est split entre les bords intérieurs des deux
+        yeux, ni œil ne le voit (sky d'un seul côté). En scannant le panorama
+        concaténé, le pique frontal apparaît entier au centre, bien bordé.
+        """
+        h, w = panorama_rgb.shape[:2]
+        if h < 2 or w < 2:
+            return np.zeros((max(1, h), max(1, w)), dtype=bool)
+        green = self._compute_green_mask(panorama_rgb)
+        sky = self._compute_sky_mask(panorama_rgb)
+        if not green.any():
+            return np.zeros((h, w), dtype=bool)
+        spike = np.zeros((h, w), dtype=bool)
+        for r in range(h):
+            rs = sky[r]
+            rg = green[r]
+            c = 0
+            while c < w:
+                while c < w and rs[c]:
+                    c += 1
+                if c >= w:
+                    break
+                s = c
+                while c < w and not rs[c]:
+                    c += 1
+                e = c
+                if s > 0 and rs[s - 1] and e < w and rs[e]:
+                    spike[r, s:e] = rg[s:e]
+        spike = self._discard_small_blobs(spike)
+        return spike
+
     def _eye_spike_mask(self, eye_img01: np.ndarray, eye: str) -> np.ndarray:
-        """Détecte les pics (sky-blade-sky horizontal) dans la ROI d'un œil."""
+        """Détecte les pics (sky-blade-sky horizontal) dans la ROI d'un œil.
+
+        Conservée pour compute_vision_debug_overlay. Le _vision_step utilise
+        _scan_spike_mask_panorama pour éviter l'angle mort binoculaire.
+        """
         h_full, w_full = eye_img01.shape[:2]
         r0 = int(self.VIS_ROI_R0 * h_full)
         r1 = int(self.VIS_ROI_R1 * h_full)
@@ -1089,6 +1156,15 @@ class Controller:
         if not green.any():
             return np.zeros((h, w), dtype=bool)
 
+        # Bord NASAL (= jonction binoculaire) traité comme sky virtuel :
+        # LEFT eye nasal = bord DROIT de la ROI (e == w) → l'autre œil voit
+        # ce qui est de l'autre côté de ce bord, donc on accepte.
+        # RIGHT eye nasal = bord GAUCHE de la ROI (s == 0).
+        # Sans ça, un pique pile-en-face split entre les deux yeux n'est vu
+        # par aucun (sky d'un seul côté de chaque demi-pique).
+        nasal_edge_is_right = (eye == "left")   # bord droit = nasal
+        nasal_edge_is_left = (eye == "right")   # bord gauche = nasal
+
         # Pour chaque ligne, on cherche les segments grass entourés horizontalement
         # par sky/cloud → ce sont des pics qui dépassent du sol.
         spike = np.zeros((h, w), dtype=bool)
@@ -1105,7 +1181,9 @@ class Controller:
                 while c < w and not rs[c]:
                     c += 1
                 e = c
-                if s > 0 and rs[s - 1] and e < w and rs[e]:
+                left_ok = (s > 0 and rs[s - 1]) or (s == 0 and nasal_edge_is_left)
+                right_ok = (e < w and rs[e]) or (e == w and nasal_edge_is_right)
+                if left_ok and right_ok:
                     spike[r, s:e] = rg[s:e]
 
         spike = self._discard_small_blobs(spike)
@@ -1253,7 +1331,8 @@ class Controller:
                 ).astype(np.uint8)
 
             if spike_roi.shape == roi_view.shape[:2]:
-                roi_view[spike_roi] = np.array([20, 255, 40], dtype=np.uint8)
+                # Rouge vif : distinct du vert des piques eux-mêmes
+                roi_view[spike_roi] = np.array([255, 30, 30], dtype=np.uint8)
 
             cyan = np.array([0, 220, 220], dtype=np.uint8)
             overlay[r0 : r0 + 1, c0:c1, :] = cyan
