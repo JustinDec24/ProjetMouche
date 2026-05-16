@@ -1,3 +1,6 @@
+import os
+from dataclasses import dataclass
+
 import numpy as np
 
 from miniproject.simulation import MiniprojectSimulation
@@ -7,30 +10,38 @@ try:
 except ImportError:
     _SCIPY_NDIMAGE = None
 
+_SPIKE_CONN = np.ones((3, 3), dtype=np.int32)
+
+
+@dataclass
+class _VisFlags:
+    """Flat container of visual reflex flags emitted by `_vision_step`."""
+
+    bump: bool = False
+    loom: bool = False
+    dragonfly: bool = False
+
 
 class Controller:
-    """Vision edge-based + repulsion field steering pour Level 2.
+    """Cap banane + interrupt vision.
 
-    Pipeline :
-      1. Stop sur banane (distance ou odor)
-      2. Terrain stuck/escape (anti-trap mesh)
-      3. ALIGN initial (pivot sur place vers banane)
-      4. Vision : détection arêtes verticales + colonnes solid-green sur
-         panorama bi-oculaire → liste de spikes (pos, strength)
-      5. Steering : champ de répulsion sur tous les spikes + cap banane
-      6. Terrain : slope braking, slope-bias steering, tilt-adaptive grip
+    Steering = `target_bias` (cap banane) ; vision agit en interruption :
+    quand un pic obstrue la trajectoire, on bascule en AVOID (PIVOT
+    frontal ou ARC latéral) jusqu'à ce que la voie soit dégagée.
     """
 
     # --- scheduling ---
-    DECISION_INTERVAL_S = 0.025  # 25 ms = 40 décisions/s
+    DECISION_INTERVAL_S = 0.025  # 25 ms = 40 decisions/s
 
     # --- olfaction (stop only) ---
     PALP_WEIGHT = 9
     ANTENNA_WEIGHT = 1
     EPS_ODOR = 1e-12
-    STOP_ODOR_THRESHOLD = 5e-3      # 10x plus permissif : laisse la mouche
-                                     # s'approcher jusqu'à STOP_DIST physique
-    STOP_DIST = 2.0
+    # NOTE: In practice, the odor magnitude at ~8–10 units distance can already
+    # exceed 2e-5 with the default arena parameters; keep this threshold higher
+    # so the fly does not stop prematurely.
+    STOP_ODOR_THRESHOLD = 1e9
+    STOP_DIST = 2.7
 
     # --- drives ---
     BASE_DRIVE_FAST = 2.40
@@ -39,8 +50,10 @@ class Controller:
     MIN_DRIVE = 0.80
     MIN_DRIVE_TERRAIN = 0.60
     MIN_SIDE_DRIVE = 0.40
-    MIN_SIDE_DRIVE_TERRAIN = 0.25
+    MIN_SIDE_DRIVE_TERRAIN = 0.55
     TURN_MOD = 0.8
+    # Couple différentiel plein en esquive (évite l'amortissement 0.8 + pente).
+    AVOID_TURN_MOD = 1.0
 
     # --- target steering (cap banane) ---
     TARGET_STEER_GAIN = 3.0
@@ -48,7 +61,7 @@ class Controller:
     TARGET_STEER_CLOSE_DIST = 24.0
     TARGET_STEER_BIAS_SCALE = 0.25
 
-    # --- terrain (Level 1+) ---
+    # --- terrain (Level 1) ---
     DOWNHILL_BRAKE = 1.6
     STEEP_BRAKE = 1.2
     TURN_STEEP_GAIN = 2.0
@@ -61,7 +74,7 @@ class Controller:
     GRIP_TILT = 0.25
     GRIP_UPRIGHTNESS = 0.60
 
-    # --- anti-roll grip ---
+    # --- anti-roll grip (any level) ---
     TILT_GRIP_ENABLE = True
     TILT_GRIP_ROLL_ON = 0.18
     TILT_GRIP_UPRIGHT_ON = 0.85
@@ -74,118 +87,142 @@ class Controller:
     TILT_LEAN_SIGN = +1.0
 
     # --- grip boost ---
-    TERRAIN_GRIP_FORCE = 6.0    # bumped 4.0→6.0 : évite que la mouche tombe sur le côté
-    WIND_GRIP_FORCE = 25.0     # L3/L4 : grip très fort pour ne pas se faire souffler
-    # Grip max sur toutes les pattes pendant les N premiers SIM STEPS (pas
-    # décisions), pour stabiliser la mouche dès le spawn sur le terrain.
-    STARTUP_MAX_GRIP_STEPS = 3000   # ~0.15 s @ timestep 1e-4
+    TERRAIN_GRIP_FORCE = 1.45  # plus d'adhérence sur collines (évite basculements → reset)
+    WIND_GRIP_FORCE = 1.80    # adhesion > 1 pour pattes au sol lors de vent
 
-    # --- orientation safety ---
-    TERRAIN_UPRIGHT_TILT_WARN = 0.35    # plus permissif (~ 70° au lieu de ~60°)
-    TERRAIN_TILT_RESET_HOLD = 80        # ~2s : laisse + de temps pour récup
-    TERRAIN_FLIP_WEAK_UPRIGHT = 0.12
-    TERRAIN_FLIP_RESET_HOLD = 60        # ~1.5s pour flip total
+    # --- orientation safety (Level 1+): resets renvoient la mouche au spawn — trop agressif = échecs L2 ---
+    TERRAIN_UPRIGHT_TILT_WARN = 0.25  # sous ce seuil on accumule des ticks « très penché »
+    TERRAIN_TILT_RESET_HOLD = 999999  # nb de décisions consécutives avant request_reset (était 12 @ 0.55)
+    TERRAIN_FLIP_WEAK_UPRIGHT = 0.12  # en dessous: fly vraiment couchée (était 0.2, trop sensible)
+    TERRAIN_FLIP_RESET_HOLD = 999999  # décisions consécutives avant sim.reset() flip (était 18)
 
-    # --- VISION (Level 2+) ---------------------------------------------------
-    # Activée seulement si _enable_grass=True. Détection panoramique
-    # bi-oculaire fusionnée en un seul vecteur de colonnes couvrant le frontal-large.
+    # --- vision (Level 2+) ---
     VISION_ENABLE = True
+    VISION_USE_RAW = True
+    VISION_DECISION_EVERY = 1
 
-    # ROI vertical : bande horizon (haut = sky/cloud, bas = sol/grass)
+    # ROI vertical (commun aux deux yeux) — bande un peu plus haute, toujours centrée.
     VIS_ROI_R0 = 0.05
     VIS_ROI_R1 = 0.78
+    # ROI horizontal : même couloir convergent nasal, mais plus large (temporal).
+    VIS_ROI_C0_LEFT = 0.40
+    VIS_ROI_C1_LEFT = 0.99
+    VIS_ROI_C0_RIGHT = 0.01
+    VIS_ROI_C1_RIGHT = 0.60
+    # Bande « centre avant » dans chaque ROI (fractions [0,1]).
+    VIS_CENTER_C0 = 0.30
+    VIS_CENTER_C1 = 0.70
 
-    # ROI horizontal par œil : zone fronto-nasale élargie à 70%.
-    # Œil gauche : moitié droite de l'image (cols hautes = côté nasal = vers l'avant).
-    # Œil droit  : moitié gauche de l'image (cols basses = côté nasal).
-    # Quand on concatène [left_ROI | right_ROI], le centre du panorama tombe
-    # exactement sur le frontal binoculaire = "pile en face".
-    VIS_ROI_C0_LEFT = 0.55
-    VIS_ROI_C1_LEFT = 0.98
-    VIS_ROI_C0_RIGHT = 0.02
-    VIS_ROI_C1_RIGHT = 0.45
+    # Colour perception.
+    VIS_COLOR_ENABLE = True
+    VIS_GRASS_GREEN_DELTA = 0.20
+    VIS_GRASS_GREEN_MIN = 0.45
 
-    # EMA pour stabilité du signal (bas = lissage plus fort, anti-wind sway)
-    VIS_EMA = 0.30
+    # Dragonfly (red eyes) detector.
+    VIS_DF_RED_DELTA = 0.20
+    VIS_DF_RED_MIN = 0.40
+    VIS_DF_AREA_ON = 0.0040
+    VIS_DF_AREA_OFF = 0.0015
+    VIS_DF_LATCH_DECISIONS = 10
+    VIS_DF_EMA = 0.55
 
-    # --- Edge-based detection (vertical edge pairing) ---
-    # Un pique = 2 arêtes verticales parallèles séparées de quelques pixels.
-    # Robuste : pas de seuil couleur, juste géométrie. Les collines ont des
-    # arêtes horizontales → exclues. Les pics ont des arêtes verticales.
-    VIS_EDGE_MAGNITUDE_THRESHOLD = 0.08    # seuil de force d'arête
-    VIS_EDGE_VERTICALITY_THRESHOLD = 0.20  # |gx|/(|gx|+|gy|) > seuil = vertical (tolère pics penchés par vent)
-    VIS_EDGE_MIN_DENSITY = 0.8            # densité par colonne (haut = filtre les piques lointains)
-    VIS_EDGE_MIN_SPIKE_WIDTH = 0           # largeur min entre 2 arêtes paires
-    VIS_EDGE_MAX_SPIKE_WIDTH = 30          # largeur max entre 2 arêtes paires
+    VIS_DEBUG_OVERLAY = True
 
-    # --- Solid-green-column detector (pique proche/large) ---
-    # Complète le pairing d'arêtes : un pique très proche ou qui sort du cadre
-    # n'a pas de paire d'arêtes (centre uniforme vert OU 1 seul bord visible).
-    # Une colonne saturée de vert = pique massif/proche.
-    VIS_GREEN_SOLID_THRESHOLD = 0.60       # fraction de colonne en vert (compense oscillations vent)
-    VIS_GREEN_DELTA = 0.025                # g > r+delta ET g > b+delta = vert (tolère ombrage vent)
+    VIS_EMA = 0.55
+    VIS_D_EMA = 0.70
 
-    # --- Steering : seuil de proximité banane (sprint final) ---
-    AVOID_DISABLE_CLOSE_DIST = 8.0  # < 8 m de la banane : on fonce sans répulsion
+    # Saturation universelle des biais (le seul gain "turn" non AVOID).
+    VIS_TURN_MAX = 3.5
 
-    # --- Repulsion field steering ---
-    # Mode alternatif au FSM AVOID : chaque spike détecté pousse la mouche dans
-    # la direction opposée. La somme des répulsions donne le bias de steering.
-    # Avantage : la mouche passe naturellement DANS les gaps entre piques au
-    # lieu de devoir choisir un côté global.
-    REPULSION_FIELD_ENABLE = True
-    REPULSION_GAIN = 12.0                 # MAX agressif sur la répulsion
-    REPULSION_FALLOFF_ALPHA = 1.2         # exp(-alpha × p²) : étendue plus large
-    REPULSION_MIN_SIZE = 0.04             # très réactif (déclenche sur petits piques)
-    REPULSION_CENTRAL_EPS = 0.12          # zone "central" un peu plus large
-    REPULSION_CENTRAL_BOOST = 200         # gros boost central
-    REPULSION_BANANA_BLEND = 0.15         # banane quasi ignorée pendant l'esquive
-    # PIVOT en mode REPUL : si le plus gros pic dépasse ce seuil, on pivote
-    # comme un fou (drives asymétriques max), peu importe le bias calculé.
-    REPULSION_PIVOT_SIZE = 0.12           # strength min pour engager le pivot REPUL
+    # Spike = grass pixel inside a horizontal sky/cloud–blade–sky/cloud segment.
+    VIS_SKY_LUM_MAX = 0.42
+    VIS_SKY_LUM_LOOSE = 0.58
+    VIS_SKY_BLUE_MARGIN = 0.02
+    VIS_CLOUD_LUM_MIN = 0.28
+    VIS_CLOUD_LUM_MAX = 1.0
+    VIS_CLOUD_RGB_SPREAD_MAX = 0.14
 
-    # Saturation universelle bias (anti-violent turn)
-    VIS_TURN_MAX = 10.0
+    VIS_SPIKE_MIN_AREA_PX = 1600  # ignore CC blobs smaller than this (≤0 = off)
+    # Filtre de forme par blob : un vrai pic est haut+étroit, alors que les
+    # silhouettes d'arbres lointains au-dessus de l'horizon sont courtes+étalées.
+    # Un blob doit satisfaire les trois critères (aire, hauteur bbox, aspect H/W).
+    VIS_SPIKE_MIN_HEIGHT_PX = 40  # hauteur minimale (en pixels) du bbox du blob
+    VIS_SPIKE_MIN_ASPECT = 1.2   # ratio min hauteur/largeur du bbox (≤0 = off)
 
-    # --- Initial alignment ---
+    # Looming reflex (priority).
+    LOOM_ENABLE = True
+    LOOM_CENTER_ON = 0.14
+    LOOM_CENTER_OFF = 0.10
+    LOOM_DAREA_ON = 0.030
+    LOOM_DAREA_OFF = 0.018
+    LOOM_LATCH_DECISIONS = 10
+
+    # Contact-based bump reflex (highest priority).
+    BUMP_ENABLE = True
+    BUMP_CONTACT_ON = 4.0
+    BUMP_CONTACT_OFF = 2.0
+    BUMP_DCONTACT_ON = 6.0
+    BUMP_DCONTACT_OFF = 2.5
+    BUMP_LATCH_DECISIONS = 12
+
+    # Jam reflex: if commanded to move but not translating (blocked), stop and pivot.
+    JAM_ENABLE = True
+    JAM_MOVE_EPS = 2.0e-2
+    JAM_MIN_DRIVE = 0.70
+    JAM_TRIGGER_DECISIONS = 4
+    JAM_LATCH_DECISIONS = 14
+
+    # Direction memory (anti flip-flop sur obstacles symétriques).
+    VIS_DIRECTION_MEMORY = True
+    VIS_LAST_DIR_DECAY = 0.95
+    VIS_LR_EPS_PIXELS = 10
+    VIS_LR_MIN_SPIKE_PIXELS = 4
+
+    # --- AVOID FSM (interruption vision) ---
+    # Trigger ON : pic au centre OU spike total > seuil OU bump/loom/dragonfly.
+    AVOID_CENTER_ON = 0.010
+    AVOID_TOTAL_ON = 0.012
+    # Trigger OFF : center ET total redescendus, pendant N décisions.
+    AVOID_CENTER_OFF = 0.003
+    AVOID_TOTAL_OFF = 0.003
+    AVOID_CLEAR_DECISIONS = 1
+    AVOID_MIN_DURATION = 5
+    # Hystérésis pour rafraîchir dodge_dir pendant l'AVOID (vision live, pas latch figé).
+    # |lr_avoid| courant ≥ ce seuil pour ré-écrire dodge_dir si le signe diffère du latch.
+    AVOID_LR_REFRESH = 0.003
+
+    # Sous-mode PIVOT vs ARC : seuil très haut = PIVOT réservé aux obstacles frontaux proches.
+    AVOID_PIVOT_CENTER = 0.050
+
+    AVOID_PIVOT_TURN = 2.0
+    # > MIN_DRIVE_TERRAIN/BASE pour garder une base réelle > plancher (couple pivot).
+    AVOID_PIVOT_SPEED = 0.65
+    AVOID_ARC_TURN = 0.5
+    AVOID_ARC_SPEED = 0.97
+    # Blend partiel vers la banane pendant ARC pour éviter les spirales.
+    AVOID_ARC_TARGET_BLEND = 0.40
+
+    # --- Initial alignment (pivot in place towards banana once) ---
+    # Au tout début (et après chaque reset), la mouche pivote sur place vers la
+    # banane avec une direction latchée. Sortie quand `|bearing| <= ALIGN_BEARING_OK`,
+    # quand un réflexe vision impose d'avorter, ou par timeout.
     ALIGN_INITIAL_ENABLE = True
-    ALIGN_BEARING_OK = 0.20
-    ALIGN_MAX_DECISIONS = 60
-    ALIGN_MAX_DRIVE_TERRAIN = 2.00
-    ALIGN_MIN_SIDE_TERRAIN = 0.25
+    ALIGN_BEARING_OK = 0.20      # ~11.5 deg
+    ALIGN_MAX_DECISIONS = 60     # ~3 s safety cap
 
-    # --- Head collision recovery (séquence fixe) ---
-    # Quand la mouche se cogne la tête (force externe > seuil), elle exécute
-    # une séquence en 3 phases : BACKUP → PIVOT vers banane → ARC autour.
-    HEAD_COLLISION_ENABLE = True
-    HEAD_COLLISION_FORCE_THRESH = 3.0           # N : très bas pour détecter même les frôlements
-    HEAD_COLLISION_COOLDOWN_DECISIONS = 0       # période sourde après une séquence
-    HEAD_COLLISION_BACKUP_DECISIONS = 45         # ~1 s en arrière
-    HEAD_COLLISION_PIVOT_DECISIONS = 3          # ~0.5 s de pivot vers banane
-    HEAD_COLLISION_ARC_DECISIONS = 0            # ~0.75 s d'arc autour de l'obstacle
-    HEAD_COLLISION_BACKUP_DRIVE = -0.6           # marche arrière (drives identiques)
-    HEAD_COLLISION_PIVOT_MAX = 2.0
-    HEAD_COLLISION_PIVOT_MIN = 0.25
-    HEAD_COLLISION_ARC_OUTER = 2.0               # roue extérieure de l'arc
-    HEAD_COLLISION_ARC_INNER = 0.6               # roue intérieure de l'arc
-    # Pose naturelle préservée : on n'écrase PAS toutes les articulations.
-    # On applique uniquement un OFFSET (additif au CPG) sur le coxa-pitch
-    # des pattes avant pour les lever juste assez à décrocher du pic.
-    # Femur/tibia restent contrôlés par le CPG → allure naturelle.
-    HEAD_COLLISION_FRONT_TUCK_DECISIONS = 15      # durée du lift (~250 ms)
-    HEAD_COLLISION_FRONT_LIFT_COXA_OFFSET = -0.5   # offset coxa-pitch (+1) : lève la patte
-
-    # --- GO mode pivot (réalignement continu) ---
-    # En GO (pas d'obstacle), si la mouche est mal alignée avec la banane,
-    # elle pivote FORT (drives asymétriques max) jusqu'à être presque dans l'axe.
-    GO_PIVOT_ENABLE = True
-    GO_PIVOT_BEARING_ON = 0.30      # |bearing| > seuil = pivote fort
-    GO_PIVOT_BEARING_OFF = 0.12     # |bearing| < seuil = arrête de pivoter (hystérésis)
+    # Après une épisode AVOID suffisamment longue (beaucoup d'étapes), on relance
+    # ALIGN avec la banane pour réorienter la locomotion avant GO.
+    ALIGN_AFTER_AVOID_ENABLE = False
+    ALIGN_AFTER_AVOID_MIN_DECISIONS = 16   # réaligner seulement après un évitement assez long.
 
     # --- debugging ---
-    DEBUG = True
-    DEBUG_EVERY_DECISIONS = 2
-    DEBUG_MAX_DECISIONS = 5000
+    DEBUG = False
+    DEBUG_EVERY_DECISIONS = 4
+    DEBUG_MAX_DECISIONS = 260
+    # Prints détaillés vision / drives (True ou env CONTROLLER_VIS_TRACE=1).
+    VIS_TRACE_VERBOSE = False
+    # Seuil relatif symétrique vs pivot dans [VIS_TRACE command] (fraction du référencement amplitude).
+    VIS_TRACE_DRIVE_EPS_FRAC = 0.015
 
     def __init__(self, sim: MiniprojectSimulation):
         from flygym.examples.locomotion import TurningController
@@ -194,6 +231,8 @@ class Controller:
         self._decision_every = int(self.DECISION_INTERVAL_S / sim.timestep)
         self._step_count = 0
         self._drives = np.array([1.0, 1.0])
+        self._last_vision_turn_bias = 0.0
+        self._last_vis_trace = None
         self._stopped = False
         self._enable_terrain = bool(getattr(sim, "enable_terrain", False))
         self._enable_grass = bool(getattr(sim, "enable_grass", False))
@@ -206,12 +245,9 @@ class Controller:
         body_ids = sim._internal_bodyids_by_fly[sim.fly.name]
         self._thorax_body_id = body_ids[self._thorax_idx]
         self._contact_body_ids = sim._internal_contact_body_segment_ids_by_fly[sim.fly.name]
-        try:
-            head_idx = next(i for i, s in enumerate(fly_segs) if s.name == "c_head")
-            self._head_body_id = body_ids[head_idx]
-        except StopIteration:
-            self._head_body_id = self._thorax_body_id
-
+        self._vision_rect_idx = None
+        self._vision_rect_mask = None
+        self._vision_step_count = 0
         self._last_xy = None
         self._stuck_decisions = 0
         self._escape_decisions_left = 0
@@ -224,60 +260,90 @@ class Controller:
         self._last_dist_to_banana = None
         self._debug_decisions = 0
 
-        # Vision state (EMA)
-        self._vis_obs_size = 0.0       # taille pic prioritaire (pour overlay debug)
-        self._vis_obs_x = 0.0          # position pic prioritaire (pour overlay debug)
-        self._vis_debug_overlay = None
-        # Liste de tous les spikes détectés au dernier frame (pour repulsion field)
-        # Chaque entrée : (pos_normalized ∈ [-1,+1], strength ∈ [0,1])
-        self._vis_all_spikes: list[tuple[float, float]] = []
+        # Vision EMAs (kept for stability + debug trace).
+        self._vis_left_area = 0.0
+        self._vis_right_area = 0.0
+        self._vis_center_area = 0.0
+        self._vis_total_area = 0.0
+        self._vis_total_area_prev = 0.0
+        self._vis_d_total_area = 0.0
+        self._vis_last_dir = 1.0
 
-        # Initial alignment state
+        # Reflex latches.
+        self._loom_left = 0
+        self._bump_left = 0
+        self._bump_contact_ema = 0.0
+        self._bump_contact_prev = 0.0
+        self._dragonfly_left = 0
+        self._vis_dragonfly_area = 0.0
+        self._vis_dragonfly_x = 0.0
+
+        # Spike LR pixel counts (used by reflexes & traces).
+        self._blade_left_px = 0
+        self._blade_right_px = 0
+
+        # Latest debug-overlay frame.
+        self._vis_debug_overlay = None
+        self._vis_spike_roi_left = None
+        self._vis_spike_roi_right = None
+
+        # Jam latch.
+        self._jam_left = 0
+        self._jam_dir = 1
+
+        # AVOID FSM state.
+        self._avoid_left = 0
+        self._avoid_min_left = 0
+        self._avoid_clear = 0
+        self._dodge_dir = 0.0
+        self._avoid_session_ticks = 0
+        self._avoid_sub = "GO"
+
+        # Initial alignment state.
         self._align_done = False
-        self._align_dir = 0.0
-        self._align_left = 0
-        # GO-mode pivot state (hystérésis)
-        self._go_pivot_active = False
-        # Head collision recovery state (séquence en phases)
-        # 0 = idle, 1 = backup, 2 = pivot toward banana, 3 = arc around
-        self._collision_phase = 0
-        self._collision_left = 0
-        self._collision_arc_dir = 1.0
-        self._collision_cooldown = 0
-        # Peak head force tracking entre 2 décisions (échantillonnage @ sim step)
-        self._head_force_peak = 0.0
+        self._align_dir = 0.0     # +1.0 = pivot LEFT, -1.0 = pivot RIGHT
+        self._align_left = 0      # safety counter (decisions remaining)
+        self._align_saw_obstacle = False  # obstacle détecté devant pendant ALIGN
 
         try:
             self._banana_xy = np.asarray(sim.world.banana_xy, dtype=float)
         except Exception:
             self._banana_xy = None
 
-        # Lift fly at spawn to free legs from terrain mesh.
+        # Lift fly at spawn to free any leg clipped into terrain mesh.
         try:
             import mujoco as _mj
             for _jnt in range(sim.mj_model.njnt):
                 if sim.mj_model.jnt_type[_jnt] == _mj.mjtJoint.mjJNT_FREE:
                     _addr = sim.mj_model.jnt_qposadr[_jnt]
-                    sim.mj_data.qpos[_addr + 2] += 0.4
+                    sim.mj_data.qpos[_addr + 2] += 2.0  # +2 mm above terrain
                     _mj.mj_forward(sim.mj_model, sim.mj_data)
                     break
         except Exception:
             pass
 
+        # Precompute row mapping for hex->rect conversion (week4 exercise pattern).
+        try:
+            retina = sim.fly.retina
+            id_rows = [np.unique(row) for row in retina.ommatidia_id_map]
+            idx_rows = []
+            max_len = 0
+            for ids in id_rows:
+                ids = ids[ids > 0]
+                idx = (ids - 1).astype(int)
+                idx_rows.append(idx)
+                max_len = max(max_len, len(idx))
+            rect_idx = -np.ones((len(idx_rows), max_len), dtype=int)
+            for r, idx in enumerate(idx_rows):
+                rect_idx[r, : len(idx)] = idx
+            self._vision_rect_idx = rect_idx
+            self._vision_rect_mask = rect_idx >= 0
+        except Exception:
+            self._vision_rect_idx = None
+            self._vision_rect_mask = None
 
     # ------------------------------------------------------------------
     def step(self, sim: MiniprojectSimulation):
-        # Track peak head force chaque sim step (catch impacts brefs entre décisions)
-        if self.HEAD_COLLISION_ENABLE:
-            try:
-                hf = float(np.linalg.norm(
-                    sim.mj_data.cfrc_ext[self._head_body_id, 3:]
-                ))
-                if hf > self._head_force_peak:
-                    self._head_force_peak = hf
-            except Exception:
-                pass
-
         is_decision_step = self._step_count % self._decision_every == 0
         if is_decision_step:
             self._drives = self._compute_drives(sim)
@@ -286,19 +352,7 @@ class Controller:
 
         joint_angles, adhesion = self.turning_controller.step(self._drives)
 
-        # --- Front legs lift au tout début du BACKUP head-collision ---
-        # Offset additif sur la coxa-pitch des pattes avant pour les lever
-        # juste assez à décrocher du pic. Femur/tibia restent CPG → allure
-        # naturelle. Actif seulement les N premières décisions du BACKUP.
-        tuck_threshold = int(self.HEAD_COLLISION_BACKUP_DECISIONS) - int(
-            self.HEAD_COLLISION_FRONT_TUCK_DECISIONS
-        )
-        if self._collision_phase == 1 and self._collision_left > tuck_threshold:
-            for li in (0, 3):
-                base = li * 7
-                joint_angles[base + 1] += float(self.HEAD_COLLISION_FRONT_LIFT_COXA_OFFSET)
-
-        # --- Active roll compensation ---
+        # --- Active roll compensation (every level) ---
         if self.TILT_LEAN_ENABLE:
             try:
                 xmat_lean = sim.mj_data.xmat[self._thorax_body_id].reshape(3, 3)
@@ -321,6 +375,7 @@ class Controller:
                     * float(self.TILT_LEAN_GAIN)
                     * ramp
                 )
+                # roll_lean > 0 -> right side down -> extend RIGHT legs ; <0 -> LEFT.
                 if roll_lean > 0:
                     leg_indices = (3, 4, 5)
                 else:
@@ -330,85 +385,65 @@ class Controller:
                     joint_angles[base + 3] += offset
                     joint_angles[base + 5] += 0.5 * offset
 
+        # Reset request: now treated as level failure (stop outputs).
         if is_decision_step and self._request_reset:
             self._request_reset = False
             self._stopped = True
             return np.zeros_like(joint_angles), np.zeros_like(adhesion)
 
-        # --- Orientation safety (terrain) ---
-        uprightness = 1.0
+        # --- Orientation safety (terrain levels) ---
         if self._enable_terrain and is_decision_step:
             try:
                 _, _, uprightness = self._get_orientation(sim)
             except Exception:
                 uprightness = 1.0
 
-            # Log uprightness toutes les 5 décisions pour diagnostic
-            if self._debug_decisions % 5 == 0:
-                print(f"[UP d={self._debug_decisions}] upright={uprightness:.2f}", flush=True)
-
             if uprightness < float(self.TERRAIN_UPRIGHT_TILT_WARN):
                 self._tilt_decisions += 1
             else:
                 self._tilt_decisions = 0
 
-            # JAMAIS de stop permanent sur tilt non plus. La mouche peut
-            # rester tiltée longtemps (sur pente) sans être vraiment KO.
             if self._tilt_decisions >= int(self.TERRAIN_TILT_RESET_HOLD):
-                self._tilt_decisions = 0  # juste reset le compteur
+                self._stopped = True
+                self._tilt_decisions = 0
+                return np.zeros_like(joint_angles), np.zeros_like(adhesion)
 
-        # --- Grip control (terrain) ---
+        # --- Grip control (terrain only) ---
         if self._enable_terrain and is_decision_step:
             if self._escape_decisions_left > 0:
                 adhesion = np.zeros_like(adhesion)
                 return joint_angles, adhesion
 
-            # JAMAIS de stop permanent sur flip. Si renversée, on freeze
-            # les drives jusqu'à récupération naturelle (slide sur pente).
-            # La mouche peut souvent ressortir d'un flip après quelques secondes.
-            if uprightness < 0.0:
-                return joint_angles, np.zeros_like(adhesion)
+            if uprightness < -0.4:
+                self._flip_decisions = 999
+            elif uprightness < float(self.TERRAIN_FLIP_WEAK_UPRIGHT):
+                self._flip_decisions += 1
+            else:
+                self._flip_decisions = 0
 
-            # Pendant la phase BACKUP de la séquence head-collision, on colle
-            # la mouche au sol avec adhésion max sur les pattes MIDDLE + HIND
-            # uniquement. Les pattes AVANT (lf, rf) restent libres pour ne pas
-            # bloquer la marche arrière.
-            in_collision_backup = self._collision_phase == 1
-            # Pendant la fenêtre startup, on force le grip max sur toutes
-            # les pattes (stabilisation à l'apparition sur le terrain).
-            in_startup_grip = self._step_count < int(self.STARTUP_MAX_GRIP_STEPS)
-            grip_val = (
-                float(self.WIND_GRIP_FORCE)
-                if (self._enable_wind or in_collision_backup or in_startup_grip)
-                else float(self.TERRAIN_GRIP_FORCE)
-            )
+            if self._flip_decisions >= int(self.TERRAIN_FLIP_RESET_HOLD):
+                self._stopped = True
+                return np.zeros_like(joint_angles), np.zeros_like(adhesion)
+
+            grip_val = float(self.WIND_GRIP_FORCE) if self._enable_wind else float(self.TERRAIN_GRIP_FORCE)
             try:
                 contact_forces = sim.mj_data.cfrc_ext[self._contact_body_ids, 3:]
                 contact_mag = np.linalg.norm(contact_forces, axis=1)
                 stance = contact_mag > self.CONTACT_THRESHOLD
                 adhesion = np.zeros_like(adhesion)
                 n = min(len(adhesion), len(stance))
-                if self._enable_wind or in_collision_backup or in_startup_grip:
-                    adhesion[:n] = grip_val
+                if self._enable_wind:
+                    # Wind needs extra grip, but only on stance legs.
+                    # Gripping all legs continuously pins the gait and prevents translation.
+                    adhesion[:n] = stance[:n].astype(float) * grip_val
                 else:
                     adhesion[:n] = stance[:n].astype(float) * grip_val
-                # En BACKUP : on désactive les pattes AVANT (index 0=lf, 3=rf)
-                # ordre = [lf, lm, lh, rf, rm, rh]
-                if in_collision_backup:
-                    if n > 0:
-                        adhesion[0] = 0.0  # left front
-                    if n > 3:
-                        adhesion[3] = 0.0  # right front
             except Exception:
-                adhesion = (
-                    np.full_like(adhesion, grip_val)
-                    if (self._enable_wind or in_collision_backup or in_startup_grip)
-                    else np.where(adhesion > 0.0, grip_val, adhesion)
-                )
+                adhesion = np.full_like(adhesion, grip_val) if self._enable_wind else np.where(adhesion > 0.0, grip_val, adhesion)
 
             adhesion = np.clip(adhesion, 0.0, grip_val)
 
-        # --- Anti-roll grip (non-terrain) ---
+        # --- Anti-roll grip (every level) ---
         if self.TILT_GRIP_ENABLE and is_decision_step and not self._enable_terrain:
             try:
                 xmat = sim.mj_data.xmat[self._thorax_body_id].reshape(3, 3)
@@ -437,13 +472,13 @@ class Controller:
 
     # ------------------------------------------------------------------
     def _get_orientation(self, sim):
-        """(pitch, roll_ind, uprightness) à partir de la matrice thorax."""
+        """(pitch, roll_ind, uprightness) from thorax rotation matrix."""
         xmat = sim.mj_data.xmat[self._thorax_body_id].reshape(3, 3)
         pitch = np.arcsin(np.clip(xmat[2, 0], -1.0, 1.0))
         return pitch, xmat[2, 1], xmat[2, 2]
 
     def _get_body_frame_xy(self, sim) -> tuple[np.ndarray, np.ndarray]:
-        """(heading_xy, lateral_xy) unitaires depuis la matrice thorax."""
+        """Return (heading_xy, lateral_xy) unit vectors from thorax rotation."""
         xmat = sim.mj_data.xmat[self._thorax_body_id].reshape(3, 3)
         heading_xy = xmat[:2, 0].copy()
         lateral_xy = xmat[:2, 1].copy()
@@ -456,7 +491,7 @@ class Controller:
         return heading_xy, lateral_xy
 
     def _get_slope_signals(self, sim) -> tuple[float, float, float]:
-        """(slope_forward, slope_lateral, slope_mag) depuis la normale terrain."""
+        """Return (slope_forward, slope_lateral, slope_mag) from terrain normal."""
         world = getattr(sim, "world", None)
         get_normal = getattr(world, "get_normal", None)
         if not callable(get_normal):
@@ -483,11 +518,10 @@ class Controller:
     def _compute_target_bias(
         self, sim, thorax_xy: np.ndarray
     ) -> tuple[float, float]:
-        """Steering bias vers la banane (cap banane).
+        """Steering bias vers la banane à partir du bearing (cap banane).
 
-        Convention :
-          bearing > 0 → banane à GAUCHE  → target_bias < 0 → drives=[min,max] → tourne à GAUCHE
-          bearing < 0 → banane à DROITE → target_bias > 0 → drives=[max,min] → tourne à DROITE
+        Retourne (bias, bearing). Bias positif = il faut tourner à gauche
+        (bearing < 0 dans la convention du contrôleur).
         """
         if self._banana_xy is None:
             return 0.0, 0.0
@@ -501,7 +535,8 @@ class Controller:
         heading_xy, lateral_xy = self._get_body_frame_xy(sim)
         lateral_err = float(np.dot(lateral_xy, to_target))
         forward_err = float(np.dot(heading_xy, to_target))
-        # Banane derrière + sur le côté → demi-tour court
+        # Banane derrière et sur le côté : demi-tour court ; actif au-delà de 13 m (évite
+        # la phase finale) — pas de borne haute pour ne pas couper les trajectoires longues.
         if (
             self._enable_grass
             and self._enable_terrain
@@ -512,6 +547,7 @@ class Controller:
             s = 1.0 if lateral_err >= 0.0 else -1.0
             bearing = float(s * (np.pi - 0.42))
         else:
+            # L2 : petit forward_err>0 → atan2 trop sensible ; plancher sur fe.
             fe = float(forward_err)
             if self._enable_grass and self._enable_terrain and dist_tt < 30.0 and fe > 0.04:
                 fe = max(fe, 0.11)
@@ -526,15 +562,18 @@ class Controller:
 
     # ------------------------------------------------------------------
     def _compute_drives(self, sim) -> np.ndarray:
+        self._vis_trace_sep_emitted_this_drive = False
         if self._stopped:
             return np.array([0.0, 0.0])
 
+        # Lazy banana XY (peut être indispo au __init__).
         if self._banana_xy is None:
             try:
                 self._banana_xy = np.asarray(sim.world.banana_xy, dtype=float)
             except Exception:
                 self._banana_xy = None
 
+        # Position thorax (utilisée partout).
         try:
             thorax_xy = sim.get_body_positions(sim.fly.name)[self._thorax_idx, :2]
         except Exception:
@@ -549,7 +588,7 @@ class Controller:
                 self._stopped = True
                 return np.array([0.0, 0.0])
 
-        # ---- stuck detection / escape (terrain trap) ----
+        # ---- stuck detection + escape maneuver (terrain peut piéger la mouche) ----
         moved = float("inf")
         if self._last_xy is not None:
             moved = float(np.linalg.norm(thorax_xy - self._last_xy))
@@ -573,94 +612,36 @@ class Controller:
                 return np.array([self.MAX_DRIVE, self.MIN_SIDE_DRIVE_TERRAIN])
             return np.array([self.MIN_SIDE_DRIVE_TERRAIN, self.MAX_DRIVE])
 
-        # ---- Head collision recovery (séquence fixe en 3 phases) ----
-        if self.HEAD_COLLISION_ENABLE:
-            if self._collision_cooldown > 0:
-                self._collision_cooldown -= 1
-            # Force = peak depuis la dernière décision (catch impacts brefs)
-            head_force = float(self._head_force_peak)
-            self._head_force_peak = 0.0
-            # Déclenchement : pas en séquence + pas en cooldown + force seuil
-            if (
-                self._collision_phase == 0
-                and self._collision_cooldown == 0
-                and head_force > float(self.HEAD_COLLISION_FORCE_THRESH)
-            ):
-                # Calcule la direction banane (gauche/droite) pour l'arc
-                _tb, _br = self._compute_target_bias(sim, thorax_xy)
-                self._collision_arc_dir = 1.0 if _br < 0.0 else -1.0
-                # Phase 1 : BACKUP
-                self._collision_phase = 1
-                self._collision_left = int(self.HEAD_COLLISION_BACKUP_DECISIONS)
-                print(
-                    f"[HEAD-COLL d={self._debug_decisions}] head_force={head_force:.1f}N "
-                    f"banana_side={'L' if self._collision_arc_dir > 0 else 'R'} → BACKUP",
-                    flush=True,
-                )
+        # ---- Jam reflex (any level) ----
+        if self.JAM_ENABLE:
+            max_drive_cmd = float(np.max(self._drives)) if getattr(self, "_drives", None) is not None else 0.0
+            if moved < float(self.JAM_MOVE_EPS) and max_drive_cmd >= float(self.JAM_MIN_DRIVE):
+                self._stuck_decisions += 1
+            else:
+                self._stuck_decisions = 0
 
-            if self._collision_phase > 0:
-                self._collision_left -= 1
-                phase = self._collision_phase
-                if phase == 1:
-                    # BACKUP : reculer en ligne droite
-                    d = float(self.HEAD_COLLISION_BACKUP_DRIVE)
-                    drives = np.array([d, d])
-                elif phase == 2:
-                    # PIVOT vers banane : pivote fort côté banana
-                    mx = float(self.HEAD_COLLISION_PIVOT_MAX)
-                    mn = float(self.HEAD_COLLISION_PIVOT_MIN)
-                    if self._collision_arc_dir > 0:
-                        # banane à gauche → tourner à gauche : drive_right > drive_left
-                        drives = np.array([mn, mx])
-                    else:
-                        drives = np.array([mx, mn])
-                else:  # phase == 3
-                    # ARC autour de l'obstacle : courbe vers la banane
-                    out = float(self.HEAD_COLLISION_ARC_OUTER)
-                    inn = float(self.HEAD_COLLISION_ARC_INNER)
-                    if self._collision_arc_dir > 0:
-                        # tourne à gauche → roue gauche = inner (lente)
-                        drives = np.array([inn, out])
-                    else:
-                        drives = np.array([out, inn])
+            if self._jam_left > 0:
+                self._jam_left -= 1
 
-                # Transition de phase
-                if self._collision_left <= 0:
-                    if phase == 1:
-                        self._collision_phase = 2
-                        self._collision_left = int(self.HEAD_COLLISION_PIVOT_DECISIONS)
-                        print(f"[HEAD-COLL d={self._debug_decisions}] → PIVOT", flush=True)
-                    elif phase == 2:
-                        self._collision_phase = 3
-                        self._collision_left = int(self.HEAD_COLLISION_ARC_DECISIONS)
-                        print(f"[HEAD-COLL d={self._debug_decisions}] → ARC", flush=True)
-                    else:
-                        self._collision_phase = 0
-                        self._collision_cooldown = int(self.HEAD_COLLISION_COOLDOWN_DECISIONS)
-                        print(f"[HEAD-COLL d={self._debug_decisions}] sequence done", flush=True)
+            if self._jam_left <= 0 and self._stuck_decisions >= int(self.JAM_TRIGGER_DECISIONS):
+                self._jam_left = int(self.JAM_LATCH_DECISIONS)
+                self._stuck_decisions = 0
+                self._jam_dir *= -1
 
-                if (
-                    self.DEBUG
-                    and self._debug_decisions <= self.DEBUG_MAX_DECISIONS
-                    and (self._debug_decisions % self.DEBUG_EVERY_DECISIONS == 0)
-                ):
-                    phase_name = {1: "BACKUP", 2: "PIVOT", 3: "ARC"}.get(phase, "?")
-                    print(
-                        f"[dbg d={self._debug_decisions:4d}] mode=COLL-{phase_name} "
-                        f"left={self._collision_left} "
-                        f"drives=({drives[0]:.3f},{drives[1]:.3f})",
-                        flush=True,
-                    )
-                return drives
+            if self._jam_left > 0:
+                maxd = self.MAX_DRIVE_TERRAIN if self._enable_terrain else self.MAX_DRIVE
+                mind = self.MIN_SIDE_DRIVE_TERRAIN if self._enable_terrain else self.MIN_SIDE_DRIVE
+                if self._jam_dir > 0:
+                    return np.array([maxd, mind], dtype=float)
+                return np.array([mind, maxd], dtype=float)
 
-        # ---- Stop sur banane (olfaction) ----
-        odor_lin = sim.get_olfaction(sim.fly.name)
+        # ---- Stop sur banane (olfaction linéaire) ----
+        odor_lin = sim.get_olfaction(sim.fly.name)  # shape (4, 1)
         lp, rp, la, ra = odor_lin[:, 0]
         odor_l = self.PALP_WEIGHT * float(lp) + self.ANTENNA_WEIGHT * float(la)
         odor_r = self.PALP_WEIGHT * float(rp) + self.ANTENNA_WEIGHT * float(ra)
         mean_odor = 0.5 * (odor_l + odor_r)
         if mean_odor > self.STOP_ODOR_THRESHOLD:
-            print(f"[STOP REASON] ODOR d={self._debug_decisions} mean_odor={mean_odor:.3e} dist={dist_to_banana:.2f}", flush=True)
             self._stopped = True
             return np.array([0.0, 0.0])
 
@@ -668,38 +649,73 @@ class Controller:
         target_bias, bearing = self._compute_target_bias(sim, thorax_xy)
         self._last_target_bearing = bearing
 
-        # ---- Vision panorama (Level 2+) ----
-        obs_size = 0.0
-        obs_x = 0.0
+        # ---- Vision : un seul appel (feat + flags). ----
+        feat: dict | None = None
+        vis = _VisFlags()
         if self.VISION_ENABLE and self._enable_grass:
-            obs_size, obs_x = self._vision_step(sim)
+            if self._vision_step_count % self.VISION_DECISION_EVERY == 0:
+                feat, vis = self._vision_step(sim)
+            self._vision_step_count += 1
 
-        # ---- Initial alignment ----
+        # ---- Initial alignment: pivot in place to face the banana ----
+        # Début de niveau / reset, ou réalignement après évitement prolongé (voir
+        # `_schedule_realign_after_long_avoid`). Avorter si bump/loom/dragonfly.
         if (
             self.ALIGN_INITIAL_ENABLE
             and not self._align_done
             and self._banana_xy is not None
         ):
             if self._align_dir == 0.0:
+                # Latch direction au premier tick : bearing > 0 = banane à gauche.
                 self._align_dir = 1.0 if bearing > 0.0 else -1.0
                 self._align_left = int(self.ALIGN_MAX_DECISIONS)
 
             aligned = abs(bearing) <= float(self.ALIGN_BEARING_OK)
-            if aligned or self._align_left <= 0:
+            abort = bool(vis.bump or vis.loom or vis.dragonfly)
+            if aligned or abort or self._align_left <= 0:
                 self._align_done = True
                 self._align_left = 0
             else:
                 self._align_left -= 1
-                if self._enable_terrain:
-                    max_drive = float(self.ALIGN_MAX_DRIVE_TERRAIN)
-                    min_side = float(self.ALIGN_MIN_SIDE_TERRAIN)
-                else:
-                    max_drive = float(self.MAX_DRIVE)
-                    min_side = float(self.MIN_SIDE_DRIVE)
+                max_drive = self.MAX_DRIVE_TERRAIN if self._enable_terrain else self.MAX_DRIVE
+                min_side = self.MIN_SIDE_DRIVE_TERRAIN if self._enable_terrain else self.MIN_SIDE_DRIVE
                 if self._align_dir > 0:
+                    # bearing>0 ⇒ banane à GAUCHE → drives=[min,max] (drives[0]<drives[1]) → tourne à GAUCHE
                     drives = np.array([min_side, max_drive], dtype=float)
                 else:
+                    # bearing≤0 ⇒ banane à DROITE → drives=[max,min] (drives[0]>drives[1]) → tourne à DROITE
                     drives = np.array([max_drive, min_side], dtype=float)
+                if self._vis_trace_enabled():
+                    bd_ref = 0.5 * (float(drives[0]) + float(drives[1]))
+                    turn_cmd = self._vis_trace_command_line(
+                        float(drives[0]),
+                        float(drives[1]),
+                        bd_ref,
+                        "ALIGN",
+                        "ALIGN",
+                    )
+                    self._trace_sep_before_bundle()
+                    print(
+                        "[VIS_TRACE drives] mode=ALIGN dir={:+d} bearing={:+.3f} "
+                        "left={} aligned={} abort={} drives=({:.3f},{:.3f})".format(
+                            int(self._align_dir),
+                            float(bearing),
+                            int(self._align_left),
+                            bool(aligned),
+                            bool(abort),
+                            float(drives[0]),
+                            float(drives[1]),
+                        ),
+                        flush=True,
+                    )
+                    print("[VIS_TRACE command] {}".format(turn_cmd), flush=True)
+                    if not isinstance(self._last_vis_trace, dict):
+                        self._last_vis_trace = {}
+                    self._last_vis_trace["turn_command"] = turn_cmd
+                    self._last_vis_trace["drives_cmd"] = (
+                        float(drives[0]),
+                        float(drives[1]),
+                    )
                 if (
                     self.DEBUG
                     and self._debug_decisions <= self.DEBUG_MAX_DECISIONS
@@ -713,114 +729,25 @@ class Controller:
                     )
                 return drives
 
-        # ---- REPULSION FIELD / GO ----
-        # Tous les piques détectés exercent une force de répulsion. Pas de FSM
-        # AVOID. Si pas de piques (ou trop proche banane), GO direct vers banane.
-        close_to_banana = (
-            dist_to_banana is not None
-            and dist_to_banana < float(self.AVOID_DISABLE_CLOSE_DIST)
-        )
+        # ---- FSM AVOID/GO ----
+        self._update_avoid_state(feat, vis)
 
-        if close_to_banana:
+        if self._avoid_left > 0:
+            bias, base_drive, sub_mode = self._avoid_command(target_bias, feat, vis)
+            self._last_vision_turn_bias = float(bias - target_bias)
+        else:
             bias = float(target_bias)
             base_drive = float(self.BASE_DRIVE_FAST)
             sub_mode = "GO"
-        else:
-            rep_bias, rep_base, rep_mode, _rep_active = self._compute_repulsion_bias(
-                target_bias, list(self._vis_all_spikes)
-            )
-            bias = rep_bias
-            base_drive = rep_base
-            sub_mode = rep_mode
+            self._last_vision_turn_bias = 0.0
+        self._avoid_sub = sub_mode
 
-        # ---- REPUL-PIVOT : pivot hyper-aggressif sur gros pic détecté ----
-        # Si on est en REPUL et que le pic max dépasse le seuil, on pivote à fond.
-        if sub_mode == "REPUL" and self._vis_all_spikes:
-            p_max, s_max = max(self._vis_all_spikes, key=lambda ps: ps[1])
-            if s_max >= float(self.REPULSION_PIVOT_SIZE):
-                # Direction = signe(p_max) inversé (spike à droite → pivote gauche)
-                if abs(p_max) < float(self.REPULSION_CENTRAL_EPS):
-                    # Pile en face : utilise côté banane (sinon droite par défaut)
-                    if abs(target_bias) > 1e-9:
-                        dir_pivot = 1.0 if target_bias > 0.0 else -1.0
-                    else:
-                        dir_pivot = 1.0
-                else:
-                    dir_pivot = -1.0 if p_max > 0.0 else 1.0
-                if self._enable_terrain:
-                    pivot_max = float(self.ALIGN_MAX_DRIVE_TERRAIN)
-                    pivot_min = float(self.ALIGN_MIN_SIDE_TERRAIN)
-                else:
-                    pivot_max = float(self.MAX_DRIVE)
-                    pivot_min = float(self.MIN_SIDE_DRIVE)
-                if dir_pivot > 0:
-                    pivot_drives = np.array([pivot_max, pivot_min], dtype=float)
-                else:
-                    pivot_drives = np.array([pivot_min, pivot_max], dtype=float)
-                if (
-                    self.DEBUG
-                    and self._debug_decisions <= self.DEBUG_MAX_DECISIONS
-                    and (self._debug_decisions % self.DEBUG_EVERY_DECISIONS == 0)
-                ):
-                    dist_str = (
-                        f"{dist_to_banana:.2f}" if dist_to_banana is not None else "?"
-                    )
-                    print(
-                        f"[dbg d={self._debug_decisions:4d}] mode=REPUL-PIV "
-                        f"p_max={p_max:+.3f} s_max={s_max:.3f} dir={int(dir_pivot):+d} "
-                        f"dist={dist_str} drives=({pivot_drives[0]:.3f},{pivot_drives[1]:.3f})",
-                        flush=True,
-                    )
-                return pivot_drives
-
-        # ---- GO-mode pivot (réalignement continu vers banane) ----
-        # Si en GO et bearing > seuil ON → pivote fort. Hystérésis : continue
-        # tant que bearing > seuil OFF, puis désengage.
-        if self.GO_PIVOT_ENABLE and sub_mode == "GO":
-            ab = abs(float(bearing))
-            if self._go_pivot_active:
-                if ab < float(self.GO_PIVOT_BEARING_OFF):
-                    self._go_pivot_active = False
-            else:
-                if ab > float(self.GO_PIVOT_BEARING_ON):
-                    self._go_pivot_active = True
-
-            if self._go_pivot_active:
-                if self._enable_terrain:
-                    pivot_max = float(self.ALIGN_MAX_DRIVE_TERRAIN)
-                    pivot_min = float(self.ALIGN_MIN_SIDE_TERRAIN)
-                else:
-                    pivot_max = float(self.MAX_DRIVE)
-                    pivot_min = float(self.MIN_SIDE_DRIVE)
-                if bearing > 0:
-                    pivot_drives = np.array([pivot_min, pivot_max], dtype=float)
-                else:
-                    pivot_drives = np.array([pivot_max, pivot_min], dtype=float)
-                if (
-                    self.DEBUG
-                    and self._debug_decisions <= self.DEBUG_MAX_DECISIONS
-                    and (self._debug_decisions % self.DEBUG_EVERY_DECISIONS == 0)
-                ):
-                    dist_str = (
-                        f"{dist_to_banana:.2f}" if dist_to_banana is not None else "?"
-                    )
-                    print(
-                        f"[dbg d={self._debug_decisions:4d}] mode=GO-PIV "
-                        f"bearing={bearing:+.3f} dist={dist_str} "
-                        f"drives=({pivot_drives[0]:.3f},{pivot_drives[1]:.3f})",
-                        flush=True,
-                    )
-                return pivot_drives
-        else:
-            self._go_pivot_active = False
-
-        # ---- Terrain (slope) ----
+        # ---- Terrain (Level 1) ----
         turn_mod = self.TURN_MOD
-        slope_mag = 0.0
         if self._enable_terrain:
             slope_forward, slope_lateral, slope_mag = self._get_slope_signals(sim)
             downhill = max(0.0, -slope_forward)
-            steep_weight = 0.25 + 0.75 * downhill
+            steep_weight = 0.25 + 0.75 * downhill  # keep power when climbing
             speed_scale = 1.0 / (
                 1.0
                 + self.DOWNHILL_BRAKE * downhill
@@ -828,14 +755,13 @@ class Controller:
             )
             base_drive = base_drive * speed_scale
             slope_bias = -self.SLOPE_STEER_GAIN * float(slope_lateral) * float(downhill)
-            # Atténuation forte du slope_bias quand on évite des piques
-            # (sinon la pente annule la commande de répulsion).
-            if sub_mode == "REPUL":
-                slope_bias *= 0.15
             bias += float(np.clip(slope_bias, -self.SLOPE_STEER_MAX, self.SLOPE_STEER_MAX))
             turn_mod = turn_mod / (1.0 + self.TURN_STEEP_GAIN * max(0.0, slope_mag))
 
-        # ---- tanh + asymétrie roues ----
+        if self._avoid_left > 0:
+            turn_mod = float(self.AVOID_TURN_MOD)
+
+        # ---- tanh + asymétrie roues (logique walking actuelle) ----
         bias_norm = float(np.tanh(bias))
 
         min_drive = self.MIN_DRIVE_TERRAIN if self._enable_terrain else self.MIN_DRIVE
@@ -849,282 +775,675 @@ class Controller:
         drives[side] = max(min_side, drives[side])
         drives = np.clip(drives, 0.0, max_drive)
 
-        # TILT-adaptive : si la mouche tilte (uprightness < 0.7), blend
-        # vers drives symétriques pour éviter le flip.
-        try:
-            xmat_t = sim.mj_data.xmat[self._thorax_body_id].reshape(3, 3)
-            tilt_up = float(xmat_t[2, 2])
-        except Exception:
-            tilt_up = 1.0
-        if tilt_up < 0.70:
-            tilt_blend = min(0.90, (0.70 - tilt_up) / 0.50)
-            _mean_d = float(np.mean(drives))
-            drives = drives * (1.0 - tilt_blend) + _mean_d * tilt_blend
-            drives = np.clip(drives, 0.0, max_drive)
+        # ---- Memory of last avoid direction (anti flip-flop) ----
+        if self.VIS_DIRECTION_MEMORY and abs(self._dodge_dir) > 1e-6:
+            self._vis_last_dir = float(
+                self.VIS_LAST_DIR_DECAY * self._vis_last_dir
+                + (1.0 - self.VIS_LAST_DIR_DECAY) * self._dodge_dir
+            )
+            if abs(self._vis_last_dir) < 1e-6:
+                self._vis_last_dir = 1.0
+
+        if self._vis_trace_enabled() and self.VISION_ENABLE and self._enable_grass:
+            mode = "AVOID" if self._avoid_left > 0 else "GO"
+            ix_reduce = 1 if bias_norm > 0 else 0
+            self._trace_sep_before_bundle()
+            print(
+                "[VIS_TRACE drives] mode={} sub={} dodge_dir={:+.2f} avoid_left={} "
+                "bias_total={:+.5f} bias_norm={:+.5f} | diminue drives[{}]".format(
+                    mode,
+                    sub_mode,
+                    float(self._dodge_dir),
+                    int(self._avoid_left),
+                    float(bias),
+                    float(bias_norm),
+                    ix_reduce,
+                ),
+                flush=True,
+            )
+            print(
+                "[VIS_TRACE drives] drives=({:.4f},{:.4f}) base={:.3f} target_bias={:+.4f}".format(
+                    float(drives[0]),
+                    float(drives[1]),
+                    float(base_drive),
+                    float(target_bias),
+                ),
+                flush=True,
+            )
+            lr_for_cmd = (
+                float(self._avoid_lr_from_feat(feat)) if feat is not None else 0.0
+            )
+            turn_cmd = self._vis_trace_command_line(
+                float(drives[0]),
+                float(drives[1]),
+                float(base_drive),
+                mode,
+                sub_mode,
+                lr_avoid=lr_for_cmd,
+            )
+            print("[VIS_TRACE command] {}".format(turn_cmd), flush=True)
+            if not isinstance(self._last_vis_trace, dict):
+                self._last_vis_trace = {}
+            self._last_vis_trace["turn_command"] = turn_cmd
+            self._last_vis_trace["drives_cmd"] = (
+                float(drives[0]),
+                float(drives[1]),
+            )
 
         if (
             self.DEBUG
             and self._debug_decisions <= self.DEBUG_MAX_DECISIONS
             and (self._debug_decisions % self.DEBUG_EVERY_DECISIONS == 0)
         ):
-            dist_str = f"{dist_to_banana:.2f}" if dist_to_banana is not None else "?"
             print(
-                f"[dbg d={self._debug_decisions:4d}] mode={sub_mode:5s} "
-                f"obs_x={obs_x:+.3f} obs_sz={obs_size:.4f} "
-                f"n_spikes={len(self._vis_all_spikes)} dist={dist_str} "
-                f"bearing={bearing:+.3f} target_bias={target_bias:+.3f} "
-                f"bias={bias:+.3f} drives=({drives[0]:.3f},{drives[1]:.3f})",
+                f"[dbg d={self._debug_decisions:4d}] mode={'AVOID' if self._avoid_left>0 else 'GO':5s} "
+                f"sub={sub_mode:5s} dodge={self._dodge_dir:+.1f} align_done={self._align_done} "
+                f"dist={dist_to_banana} bearing={bearing:+.3f} target_bias={target_bias:+.3f} "
+                f"bias={bias:+.3f} bias_norm={bias_norm:+.3f} drives=({drives[0]:.3f},{drives[1]:.3f})",
                 flush=True,
             )
+
+        # Final subsumption layer: near-goal lock, grass back-off, and stability.
+        drives = self._stable_supervisor_postprocess_drives(sim, drives)
         return drives
 
     # ------------------------------------------------------------------
-    # Repulsion field steering
-    # ------------------------------------------------------------------
-    def _compute_repulsion_bias(
-        self, target_bias: float, spikes: "list[tuple[float, float]]"
-    ) -> "tuple[float, float, str, bool]":
-        """Répulsion calculée UNIQUEMENT sur le plus gros pic à l'écran.
+    def _stable_supervisor_postprocess_drives(self, sim, drives):
+        """Final safety + near-goal supervisor.
 
-        On sélectionne le spike avec la plus grande strength s ∈ [0, 1]
-        (= taille × intensité, donc le pic le plus dangereux/proche).
-        Tous les autres sont ignorés. Évite que des piques mineurs noient le
-        signal du vrai obstacle imminent.
+        The original controller still handles odor, vision and banana steering.
+        This layer only fixes the dangerous physical cases:
 
-        kernel(p) = -sign(p) × s × factor
-          - p > 0 (à droite)  → bias < 0 → tourne à GAUCHE
-          - p < 0 (à gauche)  → bias > 0 → tourne à DROITE
-          - |p| < eps (central) → boost de répulsion, sign = côté banane
-
-        Returns:
-          bias, base_drive, mode_str, active
+        1. Do not allow violent pivots on terrain/wind.
+        2. If the fly is very close to the goal, prioritize goal-lock over grass
+           avoidance, otherwise a weak grass touch can make it miss the goal.
+        3. If the fly was close to the goal but suddenly moves away, perform a
+           short reverse/back-off and reacquire the goal instead of continuing
+           straight with the goal behind.
         """
-        if not spikes:
-            return float(target_bias), float(self.BASE_DRIVE_FAST), "GO", False
+        drives = np.asarray(drives, dtype=float).copy()
 
-        # Pique le plus fort
-        p_max, s_max = max(spikes, key=lambda ps: ps[1])
-        if s_max < float(self.REPULSION_MIN_SIZE):
-            # Pic trop faible → ignoré
-            return float(target_bias), float(self.BASE_DRIVE_FAST), "GO", False
+        enable_terrain = bool(getattr(self, "_enable_terrain", False))
+        enable_wind = bool(getattr(self, "_enable_wind", False))
 
-        alpha = float(self.REPULSION_FALLOFF_ALPHA)
-        central_eps = float(self.REPULSION_CENTRAL_EPS)
-        central_boost = float(self.REPULSION_CENTRAL_BOOST)
+        if not enable_terrain:
+            return drives
 
-        if abs(p_max) < central_eps:
-            # Pile en face : direction = signe du target_bias (côté banane),
-            # sinon par défaut droite.
-            if abs(target_bias) > 1e-9:
-                sgn = 1.0 if target_bias > 0.0 else -1.0
+        # Lazy state variables for this supervisor.
+        if not hasattr(self, "_sg_min_goal_dist"):
+            self._sg_min_goal_dist = 1e9
+        if not hasattr(self, "_sg_backoff_left"):
+            self._sg_backoff_left = 0
+        if not hasattr(self, "_sg_goal_lock_left"):
+            self._sg_goal_lock_left = 0
+
+        try:
+            _, roll_ind, uprightness = self._get_orientation(sim)
+            uprightness = float(uprightness)
+            roll_abs = abs(float(roll_ind))
+        except Exception:
+            uprightness = 1.0
+            roll_abs = 0.0
+
+        dist = getattr(self, "_last_dist_to_banana", None)
+        bearing = float(getattr(self, "_last_target_bearing", 0.0))
+
+        if dist is not None:
+            dist = float(dist)
+
+            # Track the best distance once we enter the near-goal region.
+            if dist < 9.0:
+                self._sg_min_goal_dist = min(self._sg_min_goal_dist, dist)
+                self._sg_goal_lock_left = max(self._sg_goal_lock_left, 14)
+            elif dist > 13.0:
+                self._sg_min_goal_dist = 1e9
+                self._sg_goal_lock_left = 0
+
+            # If we were close but are now moving away, the fly likely brushed
+            # grass or overshot the goal. Back off briefly, then reacquire.
+            if (
+                self._sg_min_goal_dist < 6.2
+                and dist > self._sg_min_goal_dist + 0.9
+                and self._sg_backoff_left <= 0
+            ):
+                self._sg_backoff_left = 12
+                self._sg_goal_lock_left = 24
+
+        # Clear aggressive avoid/jam states during explicit goal recovery.
+        def clear_reflex_states():
+            if hasattr(self, "_avoid_left"):
+                self._avoid_left = 0
+            if hasattr(self, "_jam_left"):
+                self._jam_left = 0
+            if hasattr(self, "_dodge_dir"):
+                self._dodge_dir = 0.0
+            if hasattr(self, "_avoid_clear"):
+                self._avoid_clear = 0
+
+        # Short back-off after brushing grass / overshooting near the goal.
+        # It is intentionally gentle: enough to release a leg, not enough to
+        # destabilize the body.
+        if self._sg_backoff_left > 0:
+            self._sg_backoff_left -= 1
+            clear_reflex_states()
+
+            if self._sg_backoff_left > 6:
+                return np.array([-0.30, -0.30], dtype=float)
+
+            # After reversing, rotate gently toward the goal direction.
+            turn = float(np.clip(bearing, -0.9, 0.9))
+            mean = 0.70 if not enable_wind else 0.85
+            return np.array(
+                [mean - 0.45 * turn, mean + 0.45 * turn],
+                dtype=float,
+            )
+
+        # Goal-lock mode: if the banana is close, do not let weak grass
+        # avoidance make the fly miss it. Slow down and steer directly to target.
+        if dist is not None and (dist < 7.8 or self._sg_goal_lock_left > 0):
+            if self._sg_goal_lock_left > 0:
+                self._sg_goal_lock_left -= 1
+
+            clear_reflex_states()
+
+            # If the target is almost straight ahead and close, finish directly.
+            if dist < 5.0 and abs(bearing) < 0.38 and uprightness > 0.55:
+                return np.array([1.20, 1.20], dtype=float)
+
+            # Otherwise make a controlled arc toward the goal. Use slower speed
+            # near goal to avoid overshooting.
+            mean = 0.90 if dist < 5.8 else 1.12
+            if enable_wind:
+                mean += 0.15
+
+            # If the goal is strongly lateral, turn more and advance less.
+            if abs(bearing) > 0.75:
+                mean = 0.72 if not enable_wind else 0.88
+                turn_gain = 0.95
             else:
-                sgn = 1.0
-            factor = 1.0 + central_boost
-        else:
-            sgn = 1.0 if p_max > 0.0 else -1.0
-            factor = float(np.exp(-alpha * p_max * p_max))
+                turn_gain = 0.70
 
-        bias = -sgn * float(s_max) * factor * float(self.REPULSION_GAIN)
-        # Mélange avec cap banane (attraction)
-        bias += float(self.REPULSION_BANANA_BLEND) * float(target_bias)
-        bias = float(
-            np.clip(bias, -float(self.VIS_TURN_MAX), float(self.VIS_TURN_MAX))
+            turn = float(np.clip(turn_gain * bearing, -0.80, 0.80))
+            goal_drives = np.array(
+                [mean - turn, mean + turn],
+                dtype=float,
+            )
+
+            # Keep some drive on both sides, but allow more turning than the
+            # normal terrain safety layer.
+            min_side = 0.30 if not enable_wind else 0.50
+            max_drive = 1.65 if not enable_wind else 1.85
+            goal_drives = np.clip(goal_drives, min_side, max_drive)
+
+            # If tilted while close to goal, do not pivot; crawl straight.
+            if uprightness < 0.45 or roll_abs > 0.80:
+                return np.array([0.65, 0.65], dtype=float)
+
+            return goal_drives
+
+        # General anti-flip safety. If the fly is close to falling, suppress
+        # pivots and crawl forward.
+        if uprightness < 0.42 or roll_abs > 0.75:
+            clear_reflex_states()
+            return np.array([0.75, 0.75], dtype=float)
+
+        # Normal terrain/wind stabilization. Never allow one side to almost stop
+        # on terrain: this creates violent pivots and flips.
+        min_side = 0.75 if enable_wind else 0.55
+        drives = np.maximum(drives, min_side)
+
+        mean = 0.5 * float(drives[0] + drives[1])
+        diff = float(drives[0] - drives[1])
+
+        if enable_wind:
+            mean = max(mean, 1.40)
+            diff_cap = 0.60 if uprightness > 0.82 else 0.28
+            max_drive = 2.05
+        else:
+            mean = max(mean, 1.12)
+            diff_cap = 0.95 if uprightness > 0.82 else 0.42
+            max_drive = 2.00
+
+        diff = float(np.clip(diff, -diff_cap, diff_cap))
+
+        safe_drives = np.array(
+            [mean + 0.5 * diff, mean - 0.5 * diff],
+            dtype=float,
         )
-        base = float(self.BASE_DRIVE_FAST)
-        return bias, base, "REPUL", True
+
+        return np.clip(safe_drives, 0.0, max_drive)
 
     # ------------------------------------------------------------------
-    # Vision : edge-based vertical spike detection
+    # FSM AVOID
     # ------------------------------------------------------------------
-    def _detect_vertical_edges(
-        self, roi_rgb: np.ndarray
-    ) -> "tuple[np.ndarray, np.ndarray, np.ndarray]":
-        """Masque (h, w) des pixels arête verticale (= bord de pic).
+    def _schedule_realign_after_long_avoid(self) -> None:
+        """Si l'épisode AVOID était assez long, relancer ALIGN vers la banane."""
+        ticks = int(self._avoid_session_ticks)
+        self._avoid_session_ticks = 0
+        if (
+            not self.ALIGN_INITIAL_ENABLE
+            or not self.ALIGN_AFTER_AVOID_ENABLE
+        ):
+            return
+        if ticks >= int(self.ALIGN_AFTER_AVOID_MIN_DECISIONS):
+            self._align_done = False
+            self._align_dir = 0.0
+            self._align_left = 0
+            if self._vis_trace_enabled():
+                self._trace_sep_before_bundle()
+                print(
+                    "[VIS_TRACE align] post_avoid_realign ticks={}>={} "
+                    "(réalignement banane)".format(
+                        ticks,
+                        int(self.ALIGN_AFTER_AVOID_MIN_DECISIONS),
+                    ),
+                    flush=True,
+                )
 
-        Une arête verticale a un gradient horizontal fort (|gx| grand) et un
-        gradient vertical faible (|gy| petit). Collines = arêtes horizontales,
-        donc exclues. Pics = arêtes verticales, donc gardées.
-        """
-        gray = (
-            0.299 * roi_rgb[..., 0]
-            + 0.587 * roi_rgb[..., 1]
-            + 0.114 * roi_rgb[..., 2]
-        ).astype(np.float32)
+    def _update_avoid_state(self, feat: dict | None, vis: _VisFlags) -> None:
+        """Trigger / exit / latch dodge_dir for the AVOID state."""
+        if feat is None:
+            # Pas de vision dispo : on ne change pas l'état mais on continue à
+            # décrémenter le compte minimal d'engagement et on sort si on est
+            # déjà en AVOID sans signal.
+            if self._avoid_left > 0:
+                self._avoid_session_ticks += 1
+                self._avoid_min_left = max(0, self._avoid_min_left - 1)
+                self._avoid_clear += 1
+                if (
+                    self._avoid_min_left <= 0
+                    and self._avoid_clear >= int(self.AVOID_CLEAR_DECISIONS)
+                ):
+                    self._schedule_realign_after_long_avoid()
+                    self._avoid_left = 0
+                    self._avoid_clear = 0
+                    self._dodge_dir = 0.0
+            return
 
-        # Sobel-like gradients via convolution discrète (sans dépendance scipy)
-        # gx : différence horizontale → détecte arêtes verticales
-        # gy : différence verticale → détecte arêtes horizontales
-        if _SCIPY_NDIMAGE is not None:
-            from scipy.ndimage import sobel as _sobel
+        center_area = float(feat.get("center_area", 0.0))
+        total_area = float(feat.get("total_area", 0.0))
 
-            gx = _sobel(gray, axis=1)
-            gy = _sobel(gray, axis=0)
+        on = (
+            center_area >= float(self.AVOID_CENTER_ON)
+            or total_area >= float(self.AVOID_TOTAL_ON)
+            or bool(vis.bump)
+            or bool(vis.loom)
+            or bool(vis.dragonfly)
+        )
+        off = (
+            center_area <= float(self.AVOID_CENTER_OFF)
+            and total_area <= float(self.AVOID_TOTAL_OFF)
+            and not bool(vis.bump)
+            and not bool(vis.loom)
+            and not bool(vis.dragonfly)
+        )
+
+        if self._avoid_left > 0:
+            # Déjà en AVOID : décompte minimum + compte clear.
+            self._avoid_session_ticks += 1
+            self._avoid_min_left = max(0, self._avoid_min_left - 1)
+            if off:
+                self._avoid_clear += 1
+            else:
+                self._avoid_clear = 0
+            # Vision live : on recalcule le côté de l'obstacle à CHAQUE tick AVOID
+            # (utilisateur veut une décision recalculée à chaque étape). Convention :
+            # dodge = +sign(lr). Si lr est sous le seuil de bruit, on garde le latch.
+            lr_now = float(self._avoid_lr_from_feat(feat))
+            if abs(lr_now) >= float(self.AVOID_LR_REFRESH):
+                self._dodge_dir = float(np.sign(lr_now))
+            if (
+                self._avoid_min_left <= 0
+                and self._avoid_clear >= int(self.AVOID_CLEAR_DECISIONS)
+            ):
+                self._schedule_realign_after_long_avoid()
+                self._avoid_left = 0
+                self._avoid_clear = 0
+                self._dodge_dir = 0.0
+                return
+            self._avoid_left += 1
         else:
-            gx = np.zeros_like(gray)
-            gy = np.zeros_like(gray)
-            gx[:, 1:-1] = gray[:, 2:] - gray[:, :-2]
-            gy[1:-1, :] = gray[2:, :] - gray[:-2, :]
-
-        gx_abs = np.abs(gx)
-        gy_abs = np.abs(gy)
-        magnitude = np.sqrt(gx_abs * gx_abs + gy_abs * gy_abs)
-        verticality = gx_abs / (gx_abs + gy_abs + 1e-6)
-
-        edge_mask = (
-            magnitude > float(self.VIS_EDGE_MAGNITUDE_THRESHOLD)
-        ) & (verticality > float(self.VIS_EDGE_VERTICALITY_THRESHOLD))
-        return edge_mask, magnitude, verticality
-
-    def _vertical_edge_density(self, edge_mask: np.ndarray) -> np.ndarray:
-        """Densité par colonne d'arête verticale ∈ [0, 1]."""
-        h, _ = edge_mask.shape
-        if h == 0:
-            return np.zeros(edge_mask.shape[1], dtype=np.float32)
-        return edge_mask.sum(axis=0).astype(np.float32) / float(h)
-
-    def _find_spike_columns(self, density: np.ndarray) -> list:
-        """Trouve les pics par pairing d'arêtes verticales adjacentes.
-
-        Returns: list de (center_col, width, intensity).
-        """
-        w = int(len(density))
-        if w < 2:
-            return []
-        edge_cols = np.where(density > float(self.VIS_EDGE_MIN_DENSITY))[0]
-        if len(edge_cols) < 2:
-            return []
-
-        # Groupe les colonnes adjacentes (arête épaisse = 2-3 colonnes)
-        groups: list[list[int]] = []
-        current: list[int] = [int(edge_cols[0])]
-        for c in edge_cols[1:]:
-            c = int(c)
-            if c - current[-1] <= 2:
-                current.append(c)
+            if not on:
+                return
+            # Entrée en AVOID : latch dodge_dir.
+            # Convention motrice (validée empiriquement par observation utilisateur) :
+            #   drives[0]>drives[1] ([max,min]) ⇒ tourne à DROITE ;
+            #   drives[0]<drives[1] ([min,max]) ⇒ tourne à GAUCHE.
+            # bias_norm>0 réduit drives[1] → [max,min] → DROITE.
+            # bias_norm<0 réduit drives[0] → [min,max] → GAUCHE.
+            # lr>0 obstacle à GAUCHE → esquiver à DROITE → bias>0 → dodge=+1 = +sign(lr).
+            # lr<0 obstacle à DROITE → esquiver à GAUCHE → bias<0 → dodge=-1 = +sign(lr).
+            lr = float(self._avoid_lr_from_feat(feat))
+            if abs(lr) > 1e-9:
+                dodge = float(np.sign(lr))
+            elif self.VIS_DIRECTION_MEMORY and abs(self._vis_last_dir) > 1e-6:
+                dodge = float(np.sign(self._vis_last_dir))
             else:
-                groups.append(current)
-                current = [c]
-        groups.append(current)
+                dodge = 1.0
+            self._dodge_dir = dodge
+            self._avoid_session_ticks = 0
+            self._avoid_left = 1
+            self._avoid_min_left = int(self.AVOID_MIN_DURATION)
+            self._avoid_clear = 0
 
-        centers = [int(np.mean(g)) for g in groups]
-        strengths = [float(density[g].max()) for g in groups]
+    def _avoid_command(
+        self, target_bias: float, feat: dict | None, vis: _VisFlags
+    ) -> tuple[float, float, str]:
+        """Renvoie (bias, base_drive, sub_mode) — PIVOT (frontal) ou ARC (latéral)."""
+        center_area = float(feat.get("center_area", 0.0)) if feat is not None else 0.0
+        dodge = self._dodge_dir if abs(self._dodge_dir) > 1e-6 else 1.0
+        pivot = center_area >= float(self.AVOID_PIVOT_CENTER) or bool(vis.bump)
+        max_turn = float(self.VIS_TURN_MAX)
+        if pivot:
+            bias = float(np.clip(self.AVOID_PIVOT_TURN * dodge, -max_turn, max_turn))
+            base = float(self.AVOID_PIVOT_SPEED * self.BASE_DRIVE_FAST)
+            return bias, base, "PIVOT"
+        bias = self.AVOID_ARC_TURN * dodge + self.AVOID_ARC_TARGET_BLEND * float(target_bias)
+        bias = float(np.clip(bias, -max_turn, max_turn))
+        base = float(self.AVOID_ARC_SPEED * self.BASE_DRIVE_FAST)
+        return bias, base, "ARC"
 
-        min_w = int(self.VIS_EDGE_MIN_SPIKE_WIDTH)
-        max_w = int(self.VIS_EDGE_MAX_SPIKE_WIDTH)
-        spikes: list[tuple[int, int, float]] = []
-        for i in range(len(centers) - 1):
-            left = centers[i]
-            right = centers[i + 1]
-            width = right - left
-            if min_w <= width <= max_w:
-                center = (left + right) // 2
-                intensity = (strengths[i] + strengths[i + 1]) * 0.5
-                spikes.append((center, width, intensity))
-        return spikes
+    # ------------------------------------------------------------------
+    # Colour masks (kept verbatim — used by both detection and overlay).
+    # ------------------------------------------------------------------
+    def _compute_green_mask(self, roi_rgb: np.ndarray) -> np.ndarray:
+        """Pure-green chroma mask over the ROI (terrain + spikes)."""
+        if not self.VIS_COLOR_ENABLE:
+            return np.zeros(roi_rgb.shape[:2], dtype=bool)
+        r = roi_rgb[..., 0]
+        g = roi_rgb[..., 1]
+        b = roi_rgb[..., 2]
+        d = float(self.VIS_GRASS_GREEN_DELTA)
+        gmin = float(self.VIS_GRASS_GREEN_MIN)
+        return ((g - r) > d) & ((g - b) > d) & (g > gmin)
 
-    def _find_solid_green_spikes(
-        self, panorama_rgb: np.ndarray
-    ) -> "tuple[list, np.ndarray]":
-        """Détecte les piques massifs/proches via colonnes saturées de vert.
+    def _compute_sky_mask(self, roi_rgb: np.ndarray) -> np.ndarray:
+        """Pixels classified as sky / clouds / upper background (not grass).
 
-        Complète le pairing d'arêtes : un pique trop large pour le pairing,
-        ou qui sort du cadre (1 seul bord visible), ne déclenche pas le
-        pairing mais sature plusieurs colonnes en vert. On les regroupe.
-
-        Returns:
-          spikes : list de (center, width, intensity)
-          green_col_mask : bool array (w,) marquant les colonnes solid-green
+        Grass uses the saturated chroma gate.  Sky-like pixels are: dark or
+        blue-tinted (classic sky), OR bright neutral patches (clouds: similar
+        R,G,B so spike silhouettes still read as sky–blade–sky).
         """
-        h, w = panorama_rgb.shape[:2]
-        if h < 2 or w < 2:
-            return [], np.zeros(w, dtype=bool)
+        if not self.VIS_COLOR_ENABLE:
+            return np.zeros(roi_rgb.shape[:2], dtype=bool)
+        r = roi_rgb[..., 0]
+        g = roi_rgb[..., 1]
+        b = roi_rgb[..., 2]
+        lum = (0.299 * r + 0.587 * g + 0.114 * b).astype(np.float32)
+        grass = self._compute_green_mask(roi_rgb)
+        bm = float(self.VIS_SKY_BLUE_MARGIN)
+        blue_ok = (b + bm >= r) & (b + bm >= g)
+        dark_ok = lum <= float(self.VIS_SKY_LUM_MAX)
+        loose_ok = lum <= float(self.VIS_SKY_LUM_LOOSE)
+        sky_blue = dark_ok | (blue_ok & loose_ok)
+        mx = np.maximum(np.maximum(r, g), b)
+        mn = np.minimum(np.minimum(r, g), b)
+        rgb_spread = (mx - mn).astype(np.float32)
+        cmin = float(self.VIS_CLOUD_LUM_MIN)
+        cmax = float(self.VIS_CLOUD_LUM_MAX)
+        spr_max = float(self.VIS_CLOUD_RGB_SPREAD_MAX)
+        cloud_ok = (
+            (lum >= cmin)
+            & (lum <= cmax)
+            & (rgb_spread <= spr_max)
+        )
+        return (~grass) & (sky_blue | cloud_ok)
 
-        r = panorama_rgb[..., 0]
-        g = panorama_rgb[..., 1]
-        b = panorama_rgb[..., 2]
-        d_g = float(self.VIS_GREEN_DELTA)
-        green_pix = (g > r + d_g) & (g > b + d_g)
-        green_frac_per_col = green_pix.sum(axis=0).astype(np.float32) / float(h)
-        solid_cols = green_frac_per_col > float(self.VIS_GREEN_SOLID_THRESHOLD)
+    def _compute_grass_mask(self, roi_rgb: np.ndarray) -> np.ndarray:
+        """Backwards-compatible alias for legacy callers."""
+        return self._compute_green_mask(roi_rgb)
 
-        spikes: list[tuple[int, int, float]] = []
-        if not solid_cols.any():
-            return spikes, solid_cols
+    def _compute_dragonfly_mask(self, roi_rgb: np.ndarray) -> np.ndarray:
+        """Bool mask of saturated-red pixels (dragonfly eyes / head)."""
+        if not self.VIS_COLOR_ENABLE:
+            return np.zeros(roi_rgb.shape[:2], dtype=bool)
+        r = roi_rgb[..., 0]
+        g = roi_rgb[..., 1]
+        b = roi_rgb[..., 2]
+        d = float(self.VIS_DF_RED_DELTA)
+        rmin = float(self.VIS_DF_RED_MIN)
+        return ((r - g) > d) & ((r - b) > d) & (r > rmin)
 
-        # Regroupe les colonnes solid-green adjacentes en piques distincts
-        cols_idx = np.where(solid_cols)[0]
-        current: list[int] = [int(cols_idx[0])]
-        for c in cols_idx[1:]:
-            c = int(c)
-            if c - current[-1] <= 1:
-                current.append(c)
-            else:
-                center = int(np.mean(current))
-                width = max(2, current[-1] - current[0] + 1)
-                intensity = float(green_frac_per_col[current].max())
-                spikes.append((center, width, intensity))
-                current = [c]
-        center = int(np.mean(current))
-        width = max(2, current[-1] - current[0] + 1)
-        intensity = float(green_frac_per_col[current].max())
-        spikes.append((center, width, intensity))
-        return spikes, solid_cols
+    # Sky/blade sandwich spikes + CC filter (aire / hauteur / aspect).
+    def _discard_small_spike_blobs(self, spike_bool: np.ndarray) -> np.ndarray:
+        """Garde seulement les composantes connexes qui ressemblent à un pic.
 
-    def _eye_spike_mask(self, eye_img01: np.ndarray, eye: str) -> np.ndarray:
-        """Renvoie un masque par-œil pour le DEBUG OVERLAY uniquement.
-
-        Marque les colonnes qui appartiennent à une paire d'arêtes verticales
-        détectée comme pique. Le _vision_step utilise une détection sur le
-        panorama complet, plus précise (les pics au centre-binoculaire sont
-        bien vus). Ici on duplique la détection par œil pour visualisation.
+        Trois critères par blob (tous doivent passer) :
+          1. aire ≥ VIS_SPIKE_MIN_AREA_PX (élimine le bruit fin),
+          2. hauteur du bbox ≥ VIS_SPIKE_MIN_HEIGHT_PX (élimine les bandes
+             horizontales fines comme les silhouettes d'arbres lointains),
+          3. ratio hauteur/largeur du bbox ≥ VIS_SPIKE_MIN_ASPECT (un vrai pic
+             est plus haut que large).
         """
+        min_px = int(self.VIS_SPIKE_MIN_AREA_PX)
+        min_h = int(self.VIS_SPIKE_MIN_HEIGHT_PX)
+        min_aspect = float(self.VIS_SPIKE_MIN_ASPECT)
+        any_filter = (min_px > 0) or (min_h > 0) or (min_aspect > 0.0)
+        if (
+            not any_filter
+            or _SCIPY_NDIMAGE is None
+            or spike_bool.size == 0
+            or not np.asarray(spike_bool, dtype=bool).any()
+        ):
+            return spike_bool
+        m = np.asarray(spike_bool, dtype=bool)
+        lbl, n_labels = _SCIPY_NDIMAGE.label(m, structure=_SPIKE_CONN)
+        if n_labels == 0:
+            return spike_bool
+
+        counts = np.bincount(lbl.ravel())
+        # bool array indexé par label, True = à supprimer.
+        bad = np.zeros(counts.shape[0], dtype=bool)
+        bad[0] = False  # background
+        if min_px > 0:
+            bad |= counts < min_px
+
+        if min_h > 0 or min_aspect > 0.0:
+            slices = _SCIPY_NDIMAGE.find_objects(lbl)
+            for i, sl in enumerate(slices, start=1):
+                if sl is None or bad[i]:
+                    continue
+                row_sl, col_sl = sl
+                bb_h = int(row_sl.stop - row_sl.start)
+                bb_w = int(col_sl.stop - col_sl.start)
+                if min_h > 0 and bb_h < min_h:
+                    bad[i] = True
+                    continue
+                if min_aspect > 0.0 and bb_w > 0:
+                    aspect = bb_h / float(bb_w)
+                    if aspect < min_aspect:
+                        bad[i] = True
+
+        return m & ~bad[lbl]
+
+    def _vis_roi_col_frac(self, eye: str) -> tuple[float, float]:
+        """Colonnes du ROI vision : eye est 'left' ou 'right'."""
+        if eye == "left":
+            return float(self.VIS_ROI_C0_LEFT), float(self.VIS_ROI_C1_LEFT)
+        return float(self.VIS_ROI_C0_RIGHT), float(self.VIS_ROI_C1_RIGHT)
+
+    def _compute_tip_profile(
+        self, eye_img01: np.ndarray, eye: str
+    ) -> tuple[np.ndarray, np.ndarray]:
         h_full, w_full = eye_img01.shape[:2]
         r0 = int(self.VIS_ROI_R0 * h_full)
         r1 = int(self.VIS_ROI_R1 * h_full)
-        if eye == "left":
-            c0 = int(self.VIS_ROI_C0_LEFT * w_full)
-            c1 = int(self.VIS_ROI_C1_LEFT * w_full)
-        else:
-            c0 = int(self.VIS_ROI_C0_RIGHT * w_full)
-            c1 = int(self.VIS_ROI_C1_RIGHT * w_full)
+        c0f, c1f = self._vis_roi_col_frac(eye)
+        c0 = int(c0f * w_full)
+        c1 = int(c1f * w_full)
         roi = eye_img01[r0:r1, c0:c1, :]
+
         h, w = roi.shape[:2]
-        if h < 2 or w < 2:
-            return np.zeros((max(1, h), max(1, w)), dtype=bool)
+        empty_mask = np.zeros((h, w), dtype=bool)
+        empty = (np.zeros(w, np.float32), empty_mask)
+        if h < 2 or w < 2 or not self.VIS_COLOR_ENABLE:
+            return empty
 
-        edge_mask, _, _ = self._detect_vertical_edges(roi)
-        density = self._vertical_edge_density(edge_mask)
-        edge_spikes = self._find_spike_columns(density)
-        _green_spikes, solid_cols = self._find_solid_green_spikes(roi)
+        green = self._compute_green_mask(roi)
+        sky = self._compute_sky_mask(roi)
+        if not green.any():
+            return empty
 
-        mask = np.zeros((h, w), dtype=bool)
-        for center, width, _intensity in edge_spikes:
-            half = max(1, width // 2 + 1)
-            c_lo = max(0, center - half)
-            c_hi = min(w, center + half + 1)
-            mask[:, c_lo:c_hi] = True
-        # Colonnes solid-green : on marque les cols saturées directement
-        if solid_cols.shape[0] == w:
-            mask[:, solid_cols] = True
-        return mask
+        spike_full = np.zeros((h, w), dtype=bool)
+        for r in range(h):
+            rs = sky[r]
+            rg = green[r]
+            c = 0
+            while c < w:
+                while c < w and rs[c]:
+                    c += 1
+                if c >= w:
+                    break
+                s = c
+                while c < w and not rs[c]:
+                    c += 1
+                e = c
+                if s > 0 and rs[s - 1] and e < w and rs[e]:
+                    spike_full[r, s:e] = rg[s:e]
 
-    def _vision_step(self, sim: MiniprojectSimulation) -> tuple[float, float]:
-        """Calcule (obs_size, obs_x) par détection d'arêtes verticales.
+        spike_full = self._discard_small_spike_blobs(spike_full)
+        tips = spike_full.sum(axis=0).astype(np.float32)
+        return tips, spike_full
 
-        Panorama = [œil_gauche_ROI | œil_droit_ROI] concaténés. Le centre
-        tombe sur le frontal binoculaire. La détection se fait sur le panorama
-        complet RGB (Sobel + verticality filter + pairing d'arêtes).
-
-        Retour :
-          obs_size ∈ [0, 1] : intensité × largeur du pic le plus prioritaire.
-          obs_x    ∈ [-1, +1] : position centroïde du pic prioritaire.
+    def _drives_pivot_label(self, d0: float, d1: float, base_drive: float) -> str:
+        """Pivot moteur effectif (convention empirique validée par observation utilisateur) :
+        drives[0]>drives[1] ⇒ tourne à DROITE ; drives[0]<drives[1] ⇒ tourne à GAUCHE.
         """
-        try:
-            frames = sim.get_raw_vision(sim.fly.name)
-        except Exception:
-            frames = None
-        if frames is None or len(frames) == 0:
-            return float(self._vis_obs_size), float(self._vis_obs_x)
+        ref = max(float(base_drive), abs(float(d0)), abs(float(d1)), 1e-9)
+        eps = max(1e-9, float(self.VIS_TRACE_DRIVE_EPS_FRAC) * ref)
+        delta = float(d0) - float(d1)
+        if abs(delta) <= eps:
+            return "moteur quasi symétrique"
+        if delta > eps:
+            return "tourne à DROITE"
+        return "tourne à GAUCHE"
+
+    def _vis_trace_command_line(
+        self,
+        d0: float,
+        d1: float,
+        base_drive: float,
+        mode: str,
+        sub_mode: str,
+        lr_avoid: float | None = None,
+    ) -> str:
+        """Libellé de décision pour la trace.
+
+        - ALIGN : « banane à GAUCHE/DROITE du cap » selon `_align_dir`.
+        - AVOID : côté de l'obstacle = signe de `lr_avoid` actuel (vision live) ;
+                  pivot moteur = comparaison réelle des drives.
+        - GO    : pivot moteur basé sur les drives.
+        """
+        if mode == "ALIGN":
+            if float(self._align_dir) > 0:
+                return "commande: ALIGN pivot vers la banane (elle est à GAUCHE du cap, bearing>0)"
+            if float(self._align_dir) < 0:
+                return "commande: ALIGN pivot vers la banane (elle est à DROITE du cap, bearing≤0)"
+            return "commande: ALIGN (direction non latchée)"
+
+        pivot_txt = self._drives_pivot_label(d0, d1, base_drive)
+
+        if mode == "AVOID":
+            sm = sub_mode or "?"
+            lr = float(lr_avoid) if lr_avoid is not None else 0.0
+            if lr > 1e-9:
+                obs_txt = "obstacle à GAUCHE (lr>0)"
+            elif lr < -1e-9:
+                obs_txt = "obstacle à DROITE (lr<0)"
+            else:
+                # Vision floue : retombe sur le latch dodge_dir (= +sign(lr)).
+                dd = float(self._dodge_dir)
+                if dd > 0:
+                    obs_txt = "obstacle (latch) à GAUCHE"
+                elif dd < 0:
+                    obs_txt = "obstacle (latch) à DROITE"
+                else:
+                    obs_txt = "obstacle (latch indéterminé)"
+            return "commande: AVOID [{}] {} → {}".format(sm, obs_txt, pivot_txt)
+
+        # GO
+        return "commande: GO {}".format(pivot_txt)
+
+    def _vis_trace_enabled(self) -> bool:
+        if bool(getattr(self.__class__, "VIS_TRACE_VERBOSE", False)):
+            return True
+        return os.environ.get("CONTROLLER_VIS_TRACE", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
+    def _trace_sep_before_bundle(self) -> None:
+        """Ligne vide avant le premier bloc de trace de cet appel à _compute_drives."""
+        if not self._vis_trace_enabled():
+            return
+        if getattr(self, "_vis_trace_sep_emitted_this_drive", False):
+            return
+        print("", flush=True)
+        self._vis_trace_sep_emitted_this_drive = True
+
+    def _avoid_lr_from_feat(self, feat: dict) -> float:
+        """LEFT vs RIGHT spike : signal de côté en repère corps.
+
+        Signal *primaire* : `raw_left_area − raw_right_area` (= « quel œil voit plus
+        de pic »). Si l'œil gauche voit plus, l'obstacle est sur la GAUCHE du corps,
+        peu importe sa position dans la colonne d'image.
+        Le delta moitiés-d'image (`spike_half_left_px − spike_half_right_px`) est
+        AMBIGU dans la zone binoculaire (un obstacle vu par un seul œil mais dans
+        la moitié centrale de cet œil bascule artificiellement le signe). On ne
+        l'utilise plus qu'en *départage* lorsque les deux yeux sont équilibrés.
+
+        Convention motrice (validée empiriquement par observation utilisateur) :
+          drives[0]>drives[1] ([max,min]) ⇒ tourne à DROITE ;
+          drives[0]<drives[1] ([min,max]) ⇒ tourne à GAUCHE.
+        Donc `_dodge_dir = +sign(lr)` : lr>0 (obstacle gauche) → dodge=+1
+        → bias>0 → réduit drives[1] → [max,min] → yaw à DROITE.
+        """
+        raw_l = float(feat.get("raw_left_area", 0.0))
+        raw_r = float(feat.get("raw_right_area", 0.0))
+        ema_l = float(feat.get("left_area", 0.0))
+        ema_r = float(feat.get("right_area", 0.0))
+
+        raw_diff = raw_l - raw_r
+        ema_diff = ema_l - ema_r
+        # Choisit la signature la plus forte (raw réagit plus vite, EMA filtre le bruit).
+        eye_diff = raw_diff if abs(raw_diff) >= abs(ema_diff) else ema_diff
+        eye_total = max(raw_l + raw_r, ema_l + ema_r, 1e-6)
+        eye_imbalance = abs(eye_diff) / eye_total  # ∈ [0, 1]
+
+        # 1) Un œil domine clairement → côté corps non ambigu, on tranche.
+        if eye_imbalance >= 0.20:
+            return float(eye_diff)
+
+        # 2) Les deux yeux voient à peu près pareil (obstacle frontal binoculaire).
+        #    On tente le départage par moitiés d'image (signal moins fiable mais utile en frontal pur).
+        ls = float(feat.get("spike_half_left_px", 0))
+        rs = float(feat.get("spike_half_right_px", 0))
+        roi_bp = float(feat.get("roi_binocular_px", 1.0))
+        tot_sp = ls + rs
+        eps_px = float(self.VIS_LR_EPS_PIXELS)
+        min_sp = float(self.VIS_LR_MIN_SPIKE_PIXELS)
+        if tot_sp >= min_sp:
+            diff_px = ls - rs
+            if abs(diff_px) >= eps_px:
+                return float(diff_px) / max(roi_bp, 1.0)
+
+        # 3) Mémoire directionnelle (anti flip-flop sur signaux quasi nuls).
+        if self.VIS_DIRECTION_MEMORY and abs(self._vis_last_dir) > 1e-6:
+            ta = float(feat.get("total_area", 0.0))
+            mag = float(max(abs(eye_diff), 0.5 * ta, 1e-6))
+            return float(np.sign(self._vis_last_dir)) * mag
+
+        return float(eye_diff)
+
+    # ------------------------------------------------------------------
+    # Vision step: extract features + reflex flags (bump / loom / dragonfly).
+    # Détection identique à l'ancienne cascade, mais centralisée.
+    # ------------------------------------------------------------------
+    def _vision_step(
+        self, sim: MiniprojectSimulation
+    ) -> tuple[dict | None, _VisFlags]:
+        flags = _VisFlags()
 
         def _to_float01(img: np.ndarray) -> np.ndarray:
             a = np.asarray(img, dtype=np.float32)
@@ -1134,88 +1453,262 @@ class Controller:
                 a = a / 255.0
             return np.clip(a, 0.0, 1.0)
 
-        left_img = _to_float01(frames[0])
-        right_img = _to_float01(frames[1] if len(frames) > 1 else frames[0])
+        def _roi(img01: np.ndarray, eye_tag: str) -> np.ndarray:
+            h, w = img01.shape[0], img01.shape[1]
+            r0, r1 = int(h * self.VIS_ROI_R0), int(h * self.VIS_ROI_R1)
+            c0f, c1f = self._vis_roi_col_frac(eye_tag)
+            c0, c1 = int(w * c0f), int(w * c1f)
+            return img01[r0:r1, c0:c1, :]
 
-        # Crop ROI par œil
-        def _extract_roi(img: np.ndarray, eye: str) -> np.ndarray:
-            h_full, w_full = img.shape[:2]
-            r0 = int(self.VIS_ROI_R0 * h_full)
-            r1 = int(self.VIS_ROI_R1 * h_full)
-            if eye == "left":
-                c0 = int(self.VIS_ROI_C0_LEFT * w_full)
-                c1 = int(self.VIS_ROI_C1_LEFT * w_full)
-            else:
-                c0 = int(self.VIS_ROI_C0_RIGHT * w_full)
-                c1 = int(self.VIS_ROI_C1_RIGHT * w_full)
-            return img[r0:r1, c0:c1, :]
+        frames = None
+        if self.VISION_USE_RAW:
+            try:
+                frames = sim.get_raw_vision(sim.fly.name)
+            except Exception:
+                frames = None
 
-        left_roi = _extract_roi(left_img, "left")
-        right_roi = _extract_roi(right_img, "right")
+        if frames is None or len(frames) == 0:
+            return None, flags
 
-        # Aligne les hauteurs
-        h = min(left_roi.shape[0], right_roi.shape[0])
-        if h < 2:
-            return float(self._vis_obs_size), float(self._vis_obs_x)
-        left_roi = left_roi[:h]
-        right_roi = right_roi[:h]
+        left_img01 = _to_float01(frames[0])
+        right_img01 = _to_float01(frames[1] if len(frames) > 1 else frames[0])
 
-        panorama_rgb = np.concatenate([left_roi, right_roi], axis=1)
-        h_p, w_p = panorama_rgb.shape[:2]
-        if w_p < 2:
-            return float(self._vis_obs_size), float(self._vis_obs_x)
+        # ---- Spikes / tips per eye ----
+        left_tips, l_spike = self._compute_tip_profile(left_img01, "left")
+        right_tips, r_spike = self._compute_tip_profile(right_img01, "right")
+        self._vis_spike_roi_left = l_spike
+        self._vis_spike_roi_right = r_spike
 
-        # Détection arêtes verticales sur le panorama complet
-        edge_mask, _mag, _vert = self._detect_vertical_edges(panorama_rgb)
-        density = self._vertical_edge_density(edge_mask)
-        edge_spikes = self._find_spike_columns(density)
+        h_full = left_img01.shape[0]
+        h_roi = int(self.VIS_ROI_R1 * h_full) - int(self.VIS_ROI_R0 * h_full)
+        wl = max(1, int(left_tips.shape[0]))
+        wr = max(1, int(right_tips.shape[0]))
+        roi_area_left = max(1, h_roi * wl)
+        roi_area_right = max(1, h_roi * wr)
+        roi_binocular_px = float(roi_area_left + roi_area_right)
 
-        # Détection complémentaire : colonnes solid-green (piques massifs/proches
-        # qui sortent du cadre ou trop larges pour le pairing d'arêtes).
-        green_spikes, _green_cols = self._find_solid_green_spikes(panorama_rgb)
+        def _half_roi_spike_px(mask: np.ndarray) -> tuple[int, int]:
+            _, ww = mask.shape
+            mid = ww // 2
+            left = int(mask[:, :mid].sum())
+            right = int(mask[:, mid:].sum())
+            return left, right
 
-        # Fusion : on prend l'union des deux listes de candidats
-        all_spikes = list(edge_spikes) + list(green_spikes)
+        ll, lr_h = _half_roi_spike_px(l_spike)
+        rl, rr = _half_roi_spike_px(r_spike)
+        spike_half_left = ll + rl
+        spike_half_right = lr_h + rr
 
-        # Stocke tous les spikes (pos, strength) pour le repulsion field.
-        self._vis_all_spikes = []
-        for center, width, intensity in all_spikes:
-            p = (center / float(max(1, w_p - 1))) * 2.0 - 1.0
-            p = float(np.clip(p, -1.0, 1.0))
-            s = min(1.0, (float(width) * float(intensity)) / 10.0)
-            self._vis_all_spikes.append((p, s))
+        left_area = float(left_tips.sum()) / float(roi_area_left)
+        right_area = float(right_tips.sum()) / float(roi_area_right)
 
-        size_raw = 0.0
-        x_raw = 0.0
-        if all_spikes:
-            best_score = -1.0
-            best_center = w_p // 2
-            best_size = 0.0
-            for center, width, intensity in all_spikes:
-                pos = (center / float(max(1, w_p - 1))) * 2.0 - 1.0
-                centrality = 1.0 - pos * pos
-                # Score d'impact = largeur × intensité × centralité
-                score = float(width) * float(intensity) * float(centrality)
-                if score > best_score:
-                    best_score = score
-                    best_center = center
-                    best_size = min(1.0, (float(width) * float(intensity)) / 10.0)
-            x_raw = (best_center / float(max(1, w_p - 1))) * 2.0 - 1.0
-            x_raw = float(np.clip(x_raw, -1.0, 1.0))
-            size_raw = float(best_size)
+        # Centre columns (straight-ahead portion of each eye ROI).
+        cL_L = int(self.VIS_CENTER_C0 * wl)
+        cR_L = max(cL_L + 1, int(self.VIS_CENTER_C1 * wl))
+        cL_R = int(self.VIS_CENTER_C0 * wr)
+        cR_R = max(cL_R + 1, int(self.VIS_CENTER_C1 * wr))
+        center_area_raw = 0.5 * (
+            float(left_tips[cL_L:cR_L].sum())
+            / max(1, h_roi * (cR_L - cL_L))
+            + float(right_tips[cL_R:cR_R].sum())
+            / max(1, h_roi * (cR_R - cL_R))
+        )
 
-        # EMA
-        ema = float(self.VIS_EMA)
-        self._vis_obs_size = ema * self._vis_obs_size + (1.0 - ema) * size_raw
-        self._vis_obs_x = ema * self._vis_obs_x + (1.0 - ema) * x_raw
+        total_area_raw = 0.5 * (left_area + right_area)
 
-        return float(self._vis_obs_size), float(self._vis_obs_x)
+        # ---- EMA smoothing (compat. seuils) ----
+        prev = float(self._vis_total_area)
+        self._vis_total_area = float(
+            self.VIS_EMA * prev + (1.0 - self.VIS_EMA) * total_area_raw
+        )
+        d_raw = float(self._vis_total_area - self._vis_total_area_prev)
+        self._vis_total_area_prev = float(self._vis_total_area)
+        self._vis_d_total_area = float(
+            self.VIS_D_EMA * self._vis_d_total_area
+            + (1.0 - self.VIS_D_EMA) * d_raw
+        )
+        self._vis_left_area = float(
+            self.VIS_EMA * self._vis_left_area + (1.0 - self.VIS_EMA) * left_area
+        )
+        self._vis_right_area = float(
+            self.VIS_EMA * self._vis_right_area + (1.0 - self.VIS_EMA) * right_area
+        )
+        self._vis_center_area = float(
+            self.VIS_EMA * self._vis_center_area
+            + (1.0 - self.VIS_EMA) * center_area_raw
+        )
+
+        # ---- Dragonfly (red eyes) ----
+        lroi = _roi(left_img01, "left")
+        rroi = _roi(right_img01, "right")
+        l_drag = self._compute_dragonfly_mask(lroi).astype(np.float32)
+        r_drag = self._compute_dragonfly_mask(rroi).astype(np.float32)
+
+        def _df_area_x(mask2d: np.ndarray) -> tuple[float, float]:
+            area = float(mask2d.mean())
+            if area <= 1e-9:
+                return 0.0, 0.0
+            cols = mask2d.mean(axis=0)
+            xs = np.linspace(-1.0, 1.0, cols.shape[0], dtype=np.float32)
+            x_mean = float((cols * xs).sum() / max(1e-9, float(cols.sum())))
+            return area, x_mean
+
+        df_left_area, df_left_x = _df_area_x(l_drag)
+        df_right_area, df_right_x = _df_area_x(r_drag)
+        df_total = 0.5 * (df_left_area + df_right_area)
+        df_w = df_left_area + df_right_area
+        df_x_raw = (
+            df_left_x * df_left_area + df_right_x * df_right_area
+        ) / max(1e-9, df_w)
+        self._vis_dragonfly_area = float(
+            self.VIS_DF_EMA * self._vis_dragonfly_area
+            + (1.0 - self.VIS_DF_EMA) * df_total
+        )
+        self._vis_dragonfly_x = float(
+            self.VIS_DF_EMA * self._vis_dragonfly_x
+            + (1.0 - self.VIS_DF_EMA) * df_x_raw
+        )
+
+        # ---- Blade pixel counts (LEFT vs RIGHT, binocular) ----
+        self._blade_left_px = spike_half_left
+        self._blade_right_px = spike_half_right
+
+        feat: dict = {
+            "left_area":           float(self._vis_left_area),
+            "right_area":          float(self._vis_right_area),
+            "raw_left_area":       left_area,
+            "raw_right_area":      right_area,
+            "center_area":         float(self._vis_center_area),
+            "total_area":          float(self._vis_total_area),
+            "d_total_area":        float(self._vis_d_total_area),
+            "dragonfly_area":      float(self._vis_dragonfly_area),
+            "dragonfly_x":         float(self._vis_dragonfly_x),
+            "left_blade_px":       spike_half_left,
+            "right_blade_px":      spike_half_right,
+            "spike_half_left_px":  spike_half_left,
+            "spike_half_right_px": spike_half_right,
+            "roi_binocular_px":    roi_binocular_px,
+        }
+
+        # ---- Reflex latches: bump / loom / dragonfly ----
+        # Bump: contact horizontal force + visual hint.
+        if self.BUMP_ENABLE:
+            contact_max = 0.0
+            try:
+                cf = sim.mj_data.cfrc_ext[self._contact_body_ids, :3]
+                mag = np.linalg.norm(cf[:, :2], axis=1)
+                contact_max = float(np.max(mag)) if mag.size > 0 else 0.0
+            except Exception:
+                contact_max = 0.0
+            prev_c = float(self._bump_contact_ema)
+            self._bump_contact_ema = float(0.90 * prev_c + 0.10 * contact_max)
+            d_contact = float(self._bump_contact_ema - self._bump_contact_prev)
+            self._bump_contact_prev = float(self._bump_contact_ema)
+
+            vis_hint = (
+                feat["center_area"] >= 0.012
+                or feat["total_area"] >= 0.018
+            )
+            on_b = (d_contact >= float(self.BUMP_DCONTACT_ON)) and vis_hint
+            off_b = (d_contact <= float(self.BUMP_DCONTACT_OFF)) and (not vis_hint)
+
+            if self._bump_left > 0:
+                self._bump_left -= 1
+            if on_b:
+                self._bump_left = max(self._bump_left, int(self.BUMP_LATCH_DECISIONS))
+            if off_b and self._bump_left <= 0:
+                self._bump_left = 0
+            flags.bump = self._bump_left > 0
+
+        # Looming: large/grown pic in front of the fly.
+        if self.LOOM_ENABLE:
+            on_l = (
+                feat["center_area"] >= float(self.LOOM_CENTER_ON)
+                or feat["d_total_area"] >= float(self.LOOM_DAREA_ON)
+            )
+            off_l = (
+                feat["center_area"] <= float(self.LOOM_CENTER_OFF)
+                and feat["d_total_area"] <= float(self.LOOM_DAREA_OFF)
+            )
+            if self._loom_left > 0:
+                self._loom_left -= 1
+            if on_l:
+                self._loom_left = max(self._loom_left, int(self.LOOM_LATCH_DECISIONS))
+            if off_l and self._loom_left <= 0:
+                self._loom_left = 0
+            flags.loom = self._loom_left > 0
+
+        # Dragonfly: saturated red blob.
+        if self.VIS_COLOR_ENABLE:
+            df_area = feat["dragonfly_area"]
+            on_d = df_area >= float(self.VIS_DF_AREA_ON)
+            off_d = df_area <= float(self.VIS_DF_AREA_OFF)
+            if self._dragonfly_left > 0:
+                self._dragonfly_left -= 1
+            if on_d:
+                self._dragonfly_left = max(
+                    self._dragonfly_left, int(self.VIS_DF_LATCH_DECISIONS)
+                )
+            if off_d and self._dragonfly_left <= 0:
+                self._dragonfly_left = 0
+            flags.dragonfly = self._dragonfly_left > 0
+
+        if self._vis_trace_enabled():
+            ls_px = int(feat["spike_half_left_px"])
+            rs_px = int(feat["spike_half_right_px"])
+            lr_avoid = float(self._avoid_lr_from_feat(feat))
+            self._trace_sep_before_bundle()
+            print(
+                "[VIS_TRACE feats] spike_half_px L={} R={} | lr_avoid={:+.6f} "
+                "(entrées vision uniquement ; décision latérale → ligne VIS_TRACE command)".format(
+                    ls_px,
+                    rs_px,
+                    lr_avoid,
+                ),
+                flush=True,
+            )
+            print(
+                "[VIS_TRACE feats] raw_area L={:.5f} R={:.5f} total={:.5f} center={:.5f} "
+                "d_total={:+.5f} df_area={:.5f}".format(
+                    float(feat["raw_left_area"]),
+                    float(feat["raw_right_area"]),
+                    float(feat["total_area"]),
+                    float(feat["center_area"]),
+                    float(feat["d_total_area"]),
+                    float(feat["dragonfly_area"]),
+                ),
+                flush=True,
+            )
+            print(
+                "[VIS_TRACE flags] bump={} loom={} dragonfly={} (latches: bump={} loom={} df={})".format(
+                    bool(flags.bump),
+                    bool(flags.loom),
+                    bool(flags.dragonfly),
+                    int(self._bump_left),
+                    int(self._loom_left),
+                    int(self._dragonfly_left),
+                ),
+                flush=True,
+            )
+
+        self._last_vis_trace = {
+            "spike_half_left_px": feat["spike_half_left_px"],
+            "spike_half_right_px": feat["spike_half_right_px"],
+            "lr_avoid": float(self._avoid_lr_from_feat(feat)),
+            "bump": bool(flags.bump),
+            "loom": bool(flags.loom),
+            "dragonfly": bool(flags.dragonfly),
+            "turn_command": None,
+            "drives_cmd": None,
+        }
+
+        return feat, flags
 
     # ------------------------------------------------------------------
     def compute_vision_debug_overlay(
         self, sim: MiniprojectSimulation
     ) -> "np.ndarray | None":
-        """Debug RGB overlay : ROI + sky tint + spikes (vert)."""
+        """Debug RGB overlay (sky tint, spikes, apex dots, dragonfly, ROI frame)."""
         try:
             frames = sim.get_raw_vision(sim.fly.name)
         except Exception:
@@ -1236,38 +1729,41 @@ class Controller:
         if len(eye_imgs) == 1:
             eye_imgs.append(eye_imgs[0])
 
-        out_eyes = []
+        out_eyes: list[np.ndarray] = []
         for ei, raw in enumerate(eye_imgs):
             eye = "left" if ei == 0 else "right"
             h, w = raw.shape[:2]
             r0, r1 = int(h * self.VIS_ROI_R0), int(h * self.VIS_ROI_R1)
-            if eye == "left":
-                c0 = int(w * self.VIS_ROI_C0_LEFT)
-                c1 = int(w * self.VIS_ROI_C1_LEFT)
-            else:
-                c0 = int(w * self.VIS_ROI_C0_RIGHT)
-                c1 = int(w * self.VIS_ROI_C1_RIGHT)
+            c0f, c1f = self._vis_roi_col_frac(eye)
+            c0, c1 = int(w * c0f), int(w * c1f)
 
             img01 = raw.astype(np.float32) / 255.0
-            spike_roi = self._eye_spike_mask(img01, eye)
+
+            _, spike_roi = self._compute_tip_profile(img01, eye)
+
+            roi = img01[r0:r1, c0:c1, :]
+            df_mask = self._compute_dragonfly_mask(roi)
 
             base = (raw.astype(np.float32) * 0.45).astype(np.uint8)
             overlay = base.copy()
             roi_view = overlay[r0:r1, c0:c1, :]
 
-            # Visualiser également le masque d'arêtes verticales (jaune pâle)
-            # pour distinguer la détection brute (arêtes) du résultat (pics).
-            roi_rgb = img01[r0:r1, c0:c1]
-            edge_mask, _, _ = self._detect_vertical_edges(roi_rgb)
-            if edge_mask.shape == roi_view.shape[:2]:
-                yellow = np.array([220, 220, 60], dtype=np.float32)
-                roi_view[edge_mask] = (
-                    roi_view[edge_mask].astype(np.float32) * 0.5 + yellow * 0.5
-                ).astype(np.uint8)
+            sky_roi = self._compute_sky_mask(roi)
+            tint = np.array([45.0, 88.0, 188.0], dtype=np.float32)
+            roi_view[sky_roi] = (
+                roi_view[sky_roi].astype(np.float32) * 0.52 + tint * 0.48
+            ).astype(np.uint8)
 
             if spike_roi.shape == roi_view.shape[:2]:
-                # Rouge vif : colonnes de pics détectés
-                roi_view[spike_roi] = np.array([255, 30, 30], dtype=np.uint8)
+                roi_view[spike_roi] = np.array([20, 255, 40], dtype=np.uint8)
+
+            cols = np.flatnonzero(np.any(spike_roi, axis=0))
+            if cols.size > 0:
+                apex_r = np.argmax(spike_roi[:, cols], axis=0)
+                roi_view[apex_r, cols, :] = np.array([255, 220, 0], dtype=np.uint8)
+
+            if df_mask.shape == roi_view.shape[:2]:
+                roi_view[df_mask] = np.array([255, 30, 30], dtype=np.uint8)
 
             cyan = np.array([0, 220, 220], dtype=np.uint8)
             overlay[r0 : r0 + 1, c0:c1, :] = cyan
