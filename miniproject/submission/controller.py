@@ -1,6 +1,19 @@
+import sys
+
 import numpy as np
 
 from miniproject.simulation import MiniprojectSimulation
+
+# Robustesse éval : les prints de debug contiennent des caractères Unicode
+# (→, é, …). Sur une console Windows cp1252 un print non encodable lève
+# UnicodeEncodeError et tue le contrôleur en pleine simulation. On reconfigure
+# stdout/stderr en UTF-8 avec fallback 'replace' pour qu'un print ne puisse
+# JAMAIS crasher le contrôleur.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 try:
     from scipy import ndimage as _SCIPY_NDIMAGE
@@ -73,10 +86,17 @@ class Controller:
     TILT_LEAN_GAIN = 0.30
     TILT_LEAN_SIGN = +1.0
 
-    # --- grip boost ---
-    TERRAIN_GRIP_FORCE = 6.0    # bumped 4.0→6.0 : évite que la mouche tombe sur le côté
-    WIND_GRIP_FORCE = 25.0     # L3/L4 : grip très fort pour ne pas se faire souffler
-    # Grip max sur toutes les pattes pendant les N premiers SIM STEPS (pas
+    # --- grip boost (merge 19/05 : grip doux kreslo + startup REPULSION) ---
+    # kreslo : grip FAIBLE appliqué uniquement aux pattes en appui — ne fige
+    # jamais la démarche (le grip fort toutes-pattes de REPULSION bloquait la
+    # translation). On garde néanmoins deux exceptions à grip FORT LOCAL :
+    #   - startup (stabilisation au spawn sur le terrain),
+    #   - phase de recul head-collision (besoin de coller au sol pour reculer).
+    TERRAIN_GRIP_FORCE = 1.45   # kreslo : grip doux, pattes en appui
+    WIND_GRIP_FORCE = 1.80     # kreslo : vent, pattes en appui (ne fige pas la marche)
+    COLLISION_BACKUP_GRIP_FORCE = 6.0  # grip fort LOCAL pendant le recul head-collision
+    STARTUP_GRIP_FORCE = 6.0    # grip fort LOCAL pour stabiliser au spawn
+    # Grip fort sur toutes les pattes pendant les N premiers SIM STEPS (pas
     # décisions), pour stabiliser la mouche dès le spawn sur le terrain.
     STARTUP_MAX_GRIP_STEPS = 3000   # ~0.15 s @ timestep 1e-4
 
@@ -369,28 +389,34 @@ class Controller:
             if uprightness < 0.0:
                 return joint_angles, np.zeros_like(adhesion)
 
-            # Pendant la phase BACKUP de la séquence head-collision, on colle
-            # la mouche au sol avec adhésion max sur les pattes MIDDLE + HIND
-            # uniquement. Les pattes AVANT (lf, rf) restent libres pour ne pas
-            # bloquer la marche arrière.
+            # Merge 19/05 : grip doux kreslo (pattes en appui seulement, ne
+            # fige pas la marche) avec deux exceptions à grip FORT LOCAL.
+            #   - startup : grip fort TOUTES pattes pour stabiliser au spawn,
+            #   - collision backup : grip fort sur pattes en appui (recul collé
+            #     au sol), pattes AVANT libérées pour ne pas bloquer la marche
+            #     arrière.
             in_collision_backup = self._collision_phase == 1
-            # Pendant la fenêtre startup, on force le grip max sur toutes
-            # les pattes (stabilisation à l'apparition sur le terrain).
             in_startup_grip = self._step_count < int(self.STARTUP_MAX_GRIP_STEPS)
-            grip_val = (
-                float(self.WIND_GRIP_FORCE)
-                if (self._enable_wind or in_collision_backup or in_startup_grip)
-                else float(self.TERRAIN_GRIP_FORCE)
-            )
+            if in_startup_grip:
+                grip_val = float(self.STARTUP_GRIP_FORCE)
+            elif in_collision_backup:
+                grip_val = float(self.COLLISION_BACKUP_GRIP_FORCE)
+            elif self._enable_wind:
+                grip_val = float(self.WIND_GRIP_FORCE)
+            else:
+                grip_val = float(self.TERRAIN_GRIP_FORCE)
             try:
                 contact_forces = sim.mj_data.cfrc_ext[self._contact_body_ids, 3:]
                 contact_mag = np.linalg.norm(contact_forces, axis=1)
                 stance = contact_mag > self.CONTACT_THRESHOLD
                 adhesion = np.zeros_like(adhesion)
                 n = min(len(adhesion), len(stance))
-                if self._enable_wind or in_collision_backup or in_startup_grip:
+                if in_startup_grip:
+                    # Spawn : grip fort sur TOUTES les pattes (REPULSION).
                     adhesion[:n] = grip_val
                 else:
+                    # kreslo : grip uniquement sur pattes en appui — ne fige
+                    # jamais la démarche (vrai pour vent, collision et normal).
                     adhesion[:n] = stance[:n].astype(float) * grip_val
                 # En BACKUP : on désactive les pattes AVANT (index 0=lf, 3=rf)
                 # ordre = [lf, lm, lh, rf, rm, rh]
@@ -402,7 +428,7 @@ class Controller:
             except Exception:
                 adhesion = (
                     np.full_like(adhesion, grip_val)
-                    if (self._enable_wind or in_collision_backup or in_startup_grip)
+                    if in_startup_grip
                     else np.where(adhesion > 0.0, grip_val, adhesion)
                 )
 
