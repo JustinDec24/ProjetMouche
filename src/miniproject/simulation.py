@@ -175,7 +175,7 @@ class MiniprojectSimulation(Simulation):
 
         world.add_fly(
             fly,
-            spawn_position=(0, 0, world.get_height(0, 0) + 0.5),
+            spawn_position=(0, 0, world.get_height(0, 0) + 1.0),
             spawn_rotation=Rotation3D("quat", (1, 0, 0, 0)),
         )
 

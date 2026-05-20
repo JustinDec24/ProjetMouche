@@ -98,7 +98,7 @@ class Controller:
     STARTUP_GRIP_FORCE = 6.0    # grip fort LOCAL pour stabiliser au spawn
     # Grip fort sur toutes les pattes pendant les N premiers SIM STEPS (pas
     # décisions), pour stabiliser la mouche dès le spawn sur le terrain.
-    STARTUP_MAX_GRIP_STEPS = 3000   # ~0.15 s @ timestep 1e-4
+    STARTUP_MAX_GRIP_STEPS = 7000   # 0.7 s @ timestep 1e-4
 
     # --- orientation safety ---
     TERRAIN_UPRIGHT_TILT_WARN = 0.35    # plus permissif (~ 70° au lieu de ~60°)
@@ -120,52 +120,54 @@ class Controller:
     # Œil droit  : moitié gauche de l'image (cols basses = côté nasal).
     # Quand on concatène [left_ROI | right_ROI], le centre du panorama tombe
     # exactement sur le frontal binoculaire = "pile en face".
-    VIS_ROI_C0_LEFT = 0.55
+    VIS_ROI_C0_LEFT = 0.45
     VIS_ROI_C1_LEFT = 0.98
     VIS_ROI_C0_RIGHT = 0.02
-    VIS_ROI_C1_RIGHT = 0.45
+    VIS_ROI_C1_RIGHT = 0.55
 
     # EMA pour stabilité du signal (bas = lissage plus fort, anti-wind sway)
     VIS_EMA = 0.30
 
-    # --- Edge-based detection (vertical edge pairing) ---
-    # Un pique = 2 arêtes verticales parallèles séparées de quelques pixels.
-    # Robuste : pas de seuil couleur, juste géométrie. Les collines ont des
-    # arêtes horizontales → exclues. Les pics ont des arêtes verticales.
-    VIS_EDGE_MAGNITUDE_THRESHOLD = 0.08    # seuil de force d'arête
-    VIS_EDGE_VERTICALITY_THRESHOLD = 0.20  # |gx|/(|gx|+|gy|) > seuil = vertical (tolère pics penchés par vent)
-    VIS_EDGE_MIN_DENSITY = 0.8            # densité par colonne (haut = filtre les piques lointains)
-    VIS_EDGE_MIN_SPIKE_WIDTH = 0           # largeur min entre 2 arêtes paires
-    VIS_EDGE_MAX_SPIKE_WIDTH = 30          # largeur max entre 2 arêtes paires
-
-    # --- Solid-green-column detector (pique proche/large) ---
-    # Complète le pairing d'arêtes : un pique très proche ou qui sort du cadre
-    # n'a pas de paire d'arêtes (centre uniforme vert OU 1 seul bord visible).
-    # Une colonne saturée de vert = pique massif/proche.
-    VIS_GREEN_SOLID_THRESHOLD = 0.60       # fraction de colonne en vert (compense oscillations vent)
-    VIS_GREEN_DELTA = 0.025                # g > r+delta ET g > b+delta = vert (tolère ombrage vent)
+    # --- Détection par excédent de silhouette ---
+    # Pipeline (cf. _vision_step) :
+    #   1. green_mask = (g > r+δ) ET (g > b+δ)              → pixels foreground
+    #   2. silhouette_height[c] = h - row(topmost vert)     → courbe 1D
+    #   3. baseline[c] = rolling-min sur fenêtre large       → niveau du terrain local
+    #   4. excess[c] = silhouette_height[c] - baseline[c]    → "ça dépasse de combien"
+    #   5. score[c] = excess²[c] × centralité²(c)            → privilégie centre & gros
+    #   6. on garde LA colonne avec score max, bbox tight    → un seul rectangle
+    # S'adapte naturellement aux pentes (la baseline suit le terrain) et capte
+    # les pics même attachés au sol (pas de masquage horizon).
+    VIS_GREEN_DELTA = 0.04125              # seuil chroma vert (g > r+δ et g > b+δ)
+    VIS_BASELINE_WINDOW_FRAC = 0.35        # fenêtre rolling-min = X×largeur panorama
+    VIS_EXCESS_MIN_PIXELS = 6              # excess en pixels mini pour considérer
+    VIS_BBOX_REL_HEIGHT = 0.5              # bbox = cols où excess > X × max_excess
+    VIS_CENTRAL_BOOST = 2.0                # exposant centralité : score = excess² × (1-p²)^B
+    # Filtre aspect-ratio : un PIC est plus haut que large (h/w ≥ ce ratio).
+    # Une COLLINE est large et basse → rejetée. Calculé sur la bbox de l'excès.
+    VIS_PEAK_MIN_ASPECT_RATIO = 1.5
 
     # --- Steering : seuil de proximité banane (sprint final) ---
     AVOID_DISABLE_CLOSE_DIST = 8.0  # < 8 m de la banane : on fonce sans répulsion
 
     # --- Repulsion field steering ---
-    # Mode alternatif au FSM AVOID : chaque spike détecté pousse la mouche dans
-    # la direction opposée. La somme des répulsions donne le bias de steering.
-    # Avantage : la mouche passe naturellement DANS les gaps entre piques au
-    # lieu de devoir choisir un côté global.
     REPULSION_FIELD_ENABLE = True
-    REPULSION_GAIN = 12.0                 # MAX agressif sur la répulsion
-    REPULSION_FALLOFF_ALPHA = 1.2         # exp(-alpha × p²) : étendue plus large
-    REPULSION_MIN_SIZE = 0.04             # très réactif (déclenche sur petits piques)
-    REPULSION_CENTRAL_EPS = 0.12          # zone "central" un peu plus large
-    REPULSION_CENTRAL_BOOST = 200         # gros boost central
-    REPULSION_BANANA_BLEND = 0.15         # banane quasi ignorée pendant l'esquive
-    # PIVOT en mode REPUL : si le plus gros pic dépasse ce seuil, on pivote
-    # comme un fou (drives asymétriques max), peu importe le bias calculé.
-    REPULSION_PIVOT_SIZE = 0.12           # strength min pour engager le pivot REPUL
+    REPULSION_GAIN = 12.0                  # MAX agressif sur la répulsion
+    REPULSION_FALLOFF_ALPHA = 1.2          # exp(-alpha × p²) : étendue plus large
+    REPULSION_CENTRAL_EPS = 0.12           # zone "central" un peu plus large
+    REPULSION_CENTRAL_BOOST = 200          # gros boost central
+    REPULSION_BANANA_BLEND = 0.15          # banane quasi ignorée pendant l'esquive
 
-    # Saturation universelle bias (anti-violent turn)
-    VIS_TURN_MAX = 10.0
+    # === Seuils en pixels verts (taille apparente du pic) ===
+    # Augmentés pour ne réagir qu'aux pics suffisamment proches/menaçants.
+    REPULSION_MIN_PIXELS = 2000            # esquive douce si pic ≥ X pixels
+    REPULSION_PIVOT_PIXELS = 3000          # pivot serré si pic ≥ X pixels
+    REPULSION_NORM_PIXELS = 5000           # normalisation interne s = min(1, px/NORM)
+
+    # Saturation universelle bias (anti-violent turn). Réduit de 10→6 pour
+    # adoucir l'esquive sur le chemin de répulsion normal (le pivot dur en cas
+    # de pic central reste inchangé, c'est juste le « turn doux » qui diminue).
+    VIS_TURN_MAX = 6.0
 
     # --- Initial alignment ---
     ALIGN_INITIAL_ENABLE = True
@@ -249,8 +251,11 @@ class Controller:
         self._vis_obs_x = 0.0          # position pic prioritaire (pour overlay debug)
         self._vis_debug_overlay = None
         # Liste de tous les spikes détectés au dernier frame (pour repulsion field)
-        # Chaque entrée : (pos_normalized ∈ [-1,+1], strength ∈ [0,1])
-        self._vis_all_spikes: list[tuple[float, float]] = []
+        # Chaque entrée : (p ∈ [-1,+1], s ∈ [0,1], px_count, col_lo, col_hi).
+        self._vis_all_spikes: list = []
+        # Per-eye spike info pour l'overlay debug-vision : (col_lo, col_hi, px).
+        self._vis_spikes_left: list = []
+        self._vis_spikes_right: list = []
 
         # Initial alignment state
         self._align_done = False
@@ -760,10 +765,14 @@ class Controller:
             sub_mode = rep_mode
 
         # ---- REPUL-PIVOT : pivot hyper-aggressif sur gros pic détecté ----
-        # Si on est en REPUL et que le pic max dépasse le seuil, on pivote à fond.
+        # Si on est en REPUL et que le pic max (en pixels) dépasse le seuil PIVOT,
+        # on pivote à fond.
         if sub_mode == "REPUL" and self._vis_all_spikes:
-            p_max, s_max = max(self._vis_all_spikes, key=lambda ps: ps[1])
-            if s_max >= float(self.REPULSION_PIVOT_SIZE):
+            best = max(self._vis_all_spikes, key=lambda t: t[2])
+            p_max = float(best[0])
+            s_max = float(best[1])
+            px_max = int(best[2])
+            if px_max >= int(self.REPULSION_PIVOT_PIXELS):
                 # Direction = signe(p_max) inversé (spike à droite → pivote gauche)
                 if abs(p_max) < float(self.REPULSION_CENTRAL_EPS):
                     # Pile en face : utilise côté banane (sinon droite par défaut)
@@ -793,7 +802,7 @@ class Controller:
                     )
                     print(
                         f"[dbg d={self._debug_decisions:4d}] mode=REPUL-PIV "
-                        f"p_max={p_max:+.3f} s_max={s_max:.3f} dir={int(dir_pivot):+d} "
+                        f"p_max={p_max:+.3f} px_max={px_max} (s={s_max:.3f}) dir={int(dir_pivot):+d} "
                         f"dist={dist_str} drives=({pivot_drives[0]:.3f},{pivot_drives[1]:.3f})",
                         flush=True,
                     )
@@ -908,14 +917,13 @@ class Controller:
     # Repulsion field steering
     # ------------------------------------------------------------------
     def _compute_repulsion_bias(
-        self, target_bias: float, spikes: "list[tuple[float, float]]"
+        self, target_bias: float, spikes: list
     ) -> "tuple[float, float, str, bool]":
-        """Répulsion calculée UNIQUEMENT sur le plus gros pic à l'écran.
+        """Répulsion calculée UNIQUEMENT sur le pic avec le plus de pixels verts.
 
-        On sélectionne le spike avec la plus grande strength s ∈ [0, 1]
-        (= taille × intensité, donc le pic le plus dangereux/proche).
-        Tous les autres sont ignorés. Évite que des piques mineurs noient le
-        signal du vrai obstacle imminent.
+        spikes : list de (p, s, px_count, col_lo, col_hi)
+        Seuil de déclenchement : REPULSION_MIN_PIXELS (compte de pixels verts
+        dans la bbox du pic). Beaucoup plus interprétable que l'ancien s∈[0,1].
 
         kernel(p) = -sign(p) × s × factor
           - p > 0 (à droite)  → bias < 0 → tourne à GAUCHE
@@ -928,10 +936,13 @@ class Controller:
         if not spikes:
             return float(target_bias), float(self.BASE_DRIVE_FAST), "GO", False
 
-        # Pique le plus fort
-        p_max, s_max = max(spikes, key=lambda ps: ps[1])
-        if s_max < float(self.REPULSION_MIN_SIZE):
-            # Pic trop faible → ignoré
+        # Pique avec le plus de pixels (= le plus gros/proche)
+        best = max(spikes, key=lambda t: t[2])
+        p_max = float(best[0])
+        s_max = float(best[1])
+        px_max = int(best[2])
+        if px_max < int(self.REPULSION_MIN_PIXELS):
+            # Pic trop petit (peu de pixels verts) → ignoré
             return float(target_bias), float(self.BASE_DRIVE_FAST), "GO", False
 
         alpha = float(self.REPULSION_FALLOFF_ALPHA)
@@ -960,179 +971,27 @@ class Controller:
         return bias, base, "REPUL", True
 
     # ------------------------------------------------------------------
-    # Vision : edge-based vertical spike detection
+    # Vision : silhouette-curve peak detection
     # ------------------------------------------------------------------
-    def _detect_vertical_edges(
-        self, roi_rgb: np.ndarray
-    ) -> "tuple[np.ndarray, np.ndarray, np.ndarray]":
-        """Masque (h, w) des pixels arête verticale (= bord de pic).
+    def _compute_silhouette_top(self, panorama_rgb: np.ndarray) -> "tuple[np.ndarray, np.ndarray]":
+        """Pour chaque colonne, calcule la row du topmost pixel foreground (vert).
 
-        Une arête verticale a un gradient horizontal fort (|gx| grand) et un
-        gradient vertical faible (|gy| petit). Collines = arêtes horizontales,
-        donc exclues. Pics = arêtes verticales, donc gardées.
-        """
-        gray = (
-            0.299 * roi_rgb[..., 0]
-            + 0.587 * roi_rgb[..., 1]
-            + 0.114 * roi_rgb[..., 2]
-        ).astype(np.float32)
-
-        # Sobel-like gradients via convolution discrète (sans dépendance scipy)
-        # gx : différence horizontale → détecte arêtes verticales
-        # gy : différence verticale → détecte arêtes horizontales
-        if _SCIPY_NDIMAGE is not None:
-            from scipy.ndimage import sobel as _sobel
-
-            gx = _sobel(gray, axis=1)
-            gy = _sobel(gray, axis=0)
-        else:
-            gx = np.zeros_like(gray)
-            gy = np.zeros_like(gray)
-            gx[:, 1:-1] = gray[:, 2:] - gray[:, :-2]
-            gy[1:-1, :] = gray[2:, :] - gray[:-2, :]
-
-        gx_abs = np.abs(gx)
-        gy_abs = np.abs(gy)
-        magnitude = np.sqrt(gx_abs * gx_abs + gy_abs * gy_abs)
-        verticality = gx_abs / (gx_abs + gy_abs + 1e-6)
-
-        edge_mask = (
-            magnitude > float(self.VIS_EDGE_MAGNITUDE_THRESHOLD)
-        ) & (verticality > float(self.VIS_EDGE_VERTICALITY_THRESHOLD))
-        return edge_mask, magnitude, verticality
-
-    def _vertical_edge_density(self, edge_mask: np.ndarray) -> np.ndarray:
-        """Densité par colonne d'arête verticale ∈ [0, 1]."""
-        h, _ = edge_mask.shape
-        if h == 0:
-            return np.zeros(edge_mask.shape[1], dtype=np.float32)
-        return edge_mask.sum(axis=0).astype(np.float32) / float(h)
-
-    def _find_spike_columns(self, density: np.ndarray) -> list:
-        """Trouve les pics par pairing d'arêtes verticales adjacentes.
-
-        Returns: list de (center_col, width, intensity).
-        """
-        w = int(len(density))
-        if w < 2:
-            return []
-        edge_cols = np.where(density > float(self.VIS_EDGE_MIN_DENSITY))[0]
-        if len(edge_cols) < 2:
-            return []
-
-        # Groupe les colonnes adjacentes (arête épaisse = 2-3 colonnes)
-        groups: list[list[int]] = []
-        current: list[int] = [int(edge_cols[0])]
-        for c in edge_cols[1:]:
-            c = int(c)
-            if c - current[-1] <= 2:
-                current.append(c)
-            else:
-                groups.append(current)
-                current = [c]
-        groups.append(current)
-
-        centers = [int(np.mean(g)) for g in groups]
-        strengths = [float(density[g].max()) for g in groups]
-
-        min_w = int(self.VIS_EDGE_MIN_SPIKE_WIDTH)
-        max_w = int(self.VIS_EDGE_MAX_SPIKE_WIDTH)
-        spikes: list[tuple[int, int, float]] = []
-        for i in range(len(centers) - 1):
-            left = centers[i]
-            right = centers[i + 1]
-            width = right - left
-            if min_w <= width <= max_w:
-                center = (left + right) // 2
-                intensity = (strengths[i] + strengths[i + 1]) * 0.5
-                spikes.append((center, width, intensity))
-        return spikes
-
-    def _find_solid_green_spikes(
-        self, panorama_rgb: np.ndarray
-    ) -> "tuple[list, np.ndarray]":
-        """Détecte les piques massifs/proches via colonnes saturées de vert.
-
-        Complète le pairing d'arêtes : un pique trop large pour le pairing,
-        ou qui sort du cadre (1 seul bord visible), ne déclenche pas le
-        pairing mais sature plusieurs colonnes en vert. On les regroupe.
-
-        Returns:
-          spikes : list de (center, width, intensity)
-          green_col_mask : bool array (w,) marquant les colonnes solid-green
+        Retourne :
+          silhouette_top    : (w,) row du pixel vert le plus haut par colonne
+                              (= h si aucun vert dans la colonne).
+          silhouette_height : (w,) hauteur de silhouette = h - silhouette_top.
         """
         h, w = panorama_rgb.shape[:2]
-        if h < 2 or w < 2:
-            return [], np.zeros(w, dtype=bool)
-
         r = panorama_rgb[..., 0]
         g = panorama_rgb[..., 1]
         b = panorama_rgb[..., 2]
         d_g = float(self.VIS_GREEN_DELTA)
-        green_pix = (g > r + d_g) & (g > b + d_g)
-        green_frac_per_col = green_pix.sum(axis=0).astype(np.float32) / float(h)
-        solid_cols = green_frac_per_col > float(self.VIS_GREEN_SOLID_THRESHOLD)
+        green_mask = (g > r + d_g) & (g > b + d_g)
+        has_fg = green_mask.any(axis=0)
+        silhouette_top = np.where(has_fg, green_mask.argmax(axis=0), h).astype(np.int32)
+        silhouette_height = (h - silhouette_top).astype(np.int32)
+        return silhouette_top, silhouette_height
 
-        spikes: list[tuple[int, int, float]] = []
-        if not solid_cols.any():
-            return spikes, solid_cols
-
-        # Regroupe les colonnes solid-green adjacentes en piques distincts
-        cols_idx = np.where(solid_cols)[0]
-        current: list[int] = [int(cols_idx[0])]
-        for c in cols_idx[1:]:
-            c = int(c)
-            if c - current[-1] <= 1:
-                current.append(c)
-            else:
-                center = int(np.mean(current))
-                width = max(2, current[-1] - current[0] + 1)
-                intensity = float(green_frac_per_col[current].max())
-                spikes.append((center, width, intensity))
-                current = [c]
-        center = int(np.mean(current))
-        width = max(2, current[-1] - current[0] + 1)
-        intensity = float(green_frac_per_col[current].max())
-        spikes.append((center, width, intensity))
-        return spikes, solid_cols
-
-    def _eye_spike_mask(self, eye_img01: np.ndarray, eye: str) -> np.ndarray:
-        """Renvoie un masque par-œil pour le DEBUG OVERLAY uniquement.
-
-        Marque les colonnes qui appartiennent à une paire d'arêtes verticales
-        détectée comme pique. Le _vision_step utilise une détection sur le
-        panorama complet, plus précise (les pics au centre-binoculaire sont
-        bien vus). Ici on duplique la détection par œil pour visualisation.
-        """
-        h_full, w_full = eye_img01.shape[:2]
-        r0 = int(self.VIS_ROI_R0 * h_full)
-        r1 = int(self.VIS_ROI_R1 * h_full)
-        if eye == "left":
-            c0 = int(self.VIS_ROI_C0_LEFT * w_full)
-            c1 = int(self.VIS_ROI_C1_LEFT * w_full)
-        else:
-            c0 = int(self.VIS_ROI_C0_RIGHT * w_full)
-            c1 = int(self.VIS_ROI_C1_RIGHT * w_full)
-        roi = eye_img01[r0:r1, c0:c1, :]
-        h, w = roi.shape[:2]
-        if h < 2 or w < 2:
-            return np.zeros((max(1, h), max(1, w)), dtype=bool)
-
-        edge_mask, _, _ = self._detect_vertical_edges(roi)
-        density = self._vertical_edge_density(edge_mask)
-        edge_spikes = self._find_spike_columns(density)
-        _green_spikes, solid_cols = self._find_solid_green_spikes(roi)
-
-        mask = np.zeros((h, w), dtype=bool)
-        for center, width, _intensity in edge_spikes:
-            half = max(1, width // 2 + 1)
-            c_lo = max(0, center - half)
-            c_hi = min(w, center + half + 1)
-            mask[:, c_lo:c_hi] = True
-        # Colonnes solid-green : on marque les cols saturées directement
-        if solid_cols.shape[0] == w:
-            mask[:, solid_cols] = True
-        return mask
 
     def _vision_step(self, sim: MiniprojectSimulation) -> tuple[float, float]:
         """Calcule (obs_size, obs_x) par détection d'arêtes verticales.
@@ -1191,44 +1050,151 @@ class Controller:
         if w_p < 2:
             return float(self._vis_obs_size), float(self._vis_obs_x)
 
-        # Détection arêtes verticales sur le panorama complet
-        edge_mask, _mag, _vert = self._detect_vertical_edges(panorama_rgb)
-        density = self._vertical_edge_density(edge_mask)
-        edge_spikes = self._find_spike_columns(density)
+        # === DÉTECTION PAR EXCÉDENT DE SILHOUETTE ============================
+        # 1. green_mask sur tout le panorama
+        # 2. silhouette_height[c] = h - row du topmost vert dans col c (0 = sky pur)
+        # 3. baseline[c] = rolling-min sur fenêtre large = niveau du terrain local
+        # 4. excess[c] = silhouette_height[c] - baseline[c]
+        # 5. score[c] = excess² × centralité²
+        # 6. on garde la col du score max ; bbox = colonnes adjacentes où
+        #    excess > VIS_BBOX_REL_HEIGHT × max_excess.
+        r_chan = panorama_rgb[..., 0]
+        g_chan = panorama_rgb[..., 1]
+        b_chan = panorama_rgb[..., 2]
+        d_g = float(self.VIS_GREEN_DELTA)
+        green_mask = (g_chan > r_chan + d_g) & (g_chan > b_chan + d_g)
+        norm_px = max(1.0, float(self.REPULSION_NORM_PIXELS))
 
-        # Détection complémentaire : colonnes solid-green (piques massifs/proches
-        # qui sortent du cadre ou trop larges pour le pairing d'arêtes).
-        green_spikes, _green_cols = self._find_solid_green_spikes(panorama_rgb)
+        detected_peaks: list = []  # 0 ou 1 entrée : (p, n_pixels, col_lo, col_hi, row_lo, row_hi)
+        if green_mask.any():
+            # 2) silhouette top par colonne
+            has_fg = green_mask.any(axis=0)
+            silhouette_top = np.where(has_fg, green_mask.argmax(axis=0), h_p).astype(np.int32)
+            silhouette_height = (h_p - silhouette_top).astype(np.int32)
+            # silhouette_height ∈ [0, h_p] ; 0 si pas de FG dans la col.
 
-        # Fusion : on prend l'union des deux listes de candidats
-        all_spikes = list(edge_spikes) + list(green_spikes)
+            # 3) baseline locale = rolling-min sur fenêtre large
+            # On exclut les cols sans FG (sky pur) pour ne pas tirer la baseline à 0
+            sentinel = h_p + 1
+            sil_for_min = np.where(has_fg, silhouette_height, sentinel)
+            win = max(3, int(float(self.VIS_BASELINE_WINDOW_FRAC) * w_p))
+            if _SCIPY_NDIMAGE is not None:
+                baseline = _SCIPY_NDIMAGE.minimum_filter1d(sil_for_min, size=win, mode="nearest")
+            else:
+                # Fallback : pad puis min via convolution naïve
+                pad = win // 2
+                padded = np.concatenate([sil_for_min[:pad][::-1], sil_for_min, sil_for_min[-pad:][::-1]])
+                baseline = np.array([padded[i:i+win].min() for i in range(w_p)], dtype=np.int32)
+            # Si la fenêtre n'a rencontré que des sentinelles, la baseline = sentinel.
+            # Clamp pour qu'elle ne dépasse pas la silhouette réelle.
+            baseline = np.minimum(baseline, silhouette_height)
+            baseline = np.maximum(baseline, 0)
 
-        # Stocke tous les spikes (pos, strength) pour le repulsion field.
+            # 4) excess = ce qui dépasse la baseline locale
+            excess = (silhouette_height - baseline).astype(np.int32)
+
+            # 5) score = excess² × centralité²
+            cols = np.arange(w_p, dtype=np.float32)
+            p_per_col = (cols / float(max(1, w_p - 1))) * 2.0 - 1.0
+            centrality = np.maximum(0.0, 1.0 - p_per_col * p_per_col)
+            boost = float(self.VIS_CENTRAL_BOOST)
+            score = (excess.astype(np.float32) ** 2) * (centrality ** boost)
+
+            # 6) max + bbox
+            best_col = int(score.argmax())
+            max_excess = int(excess[best_col])
+            if max_excess >= int(self.VIS_EXCESS_MIN_PIXELS):
+                thresh = float(self.VIS_BBOX_REL_HEIGHT) * float(max_excess)
+                # Scan gauche
+                left = best_col
+                while left > 0 and excess[left - 1] > thresh:
+                    left -= 1
+                # Scan droite
+                right = best_col
+                while right < w_p - 1 and excess[right + 1] > thresh:
+                    right += 1
+                col_lo = int(left)
+                col_hi = int(right + 1)
+                # Bbox rows : du sommet du pic au niveau de la baseline locale
+                row_lo = int(silhouette_top[col_lo:col_hi].min())
+                row_hi = int(h_p - int(baseline[col_lo:col_hi].min()))
+                row_hi = max(row_lo + 1, min(row_hi, h_p))
+                # FILTRE ASPECT-RATIO : un pic doit être plus haut que large.
+                # Une colline est large + basse → ratio h/w faible → rejeté.
+                bbox_w = max(1, col_hi - col_lo)
+                bbox_h = max(1, row_hi - row_lo)
+                aspect = bbox_h / float(bbox_w)
+                if aspect >= float(self.VIS_PEAK_MIN_ASPECT_RATIO):
+                    n_px = int(green_mask[:, col_lo:col_hi].sum())
+                    p = (float(best_col) / float(max(1, w_p - 1))) * 2.0 - 1.0
+                    p = float(np.clip(p, -1.0, 1.0))
+                    detected_peaks.append((p, n_px, col_lo, col_hi, row_lo, row_hi))
+
+        # Stockage uniforme pour la suite. _vis_all_spikes = (p, s, px, cl, ch)
+        # consommé par _compute_repulsion_bias et REPUL-PIVOT.
+        # _vis_spikes_left/right = (col_lo, col_hi, row_lo, row_hi, px) pour
+        # l'overlay debug (coords IMAGE œil, pas panorama).
         self._vis_all_spikes = []
-        for center, width, intensity in all_spikes:
-            p = (center / float(max(1, w_p - 1))) * 2.0 - 1.0
-            p = float(np.clip(p, -1.0, 1.0))
-            s = min(1.0, (float(width) * float(intensity)) / 10.0)
-            self._vis_all_spikes.append((p, s))
+        self._vis_spikes_left = []
+        self._vis_spikes_right = []
+        spike_debug_lines = []
+        w_left = left_roi.shape[1]
+        h_left_eye_full = left_img.shape[0]
+        w_left_eye_full = left_img.shape[1]
+        w_right_eye_full = right_img.shape[1]
+        c0_left_px = int(self.VIS_ROI_C0_LEFT * w_left_eye_full)
+        c0_right_px = int(self.VIS_ROI_C0_RIGHT * w_right_eye_full)
+        r0_eye_px = int(self.VIS_ROI_R0 * h_left_eye_full)  # même r0 pour les 2 yeux
+        for p, px_count, col_lo, col_hi, row_lo, row_hi in detected_peaks:
+            s = min(1.0, float(px_count) / norm_px)
+            self._vis_all_spikes.append((p, s, px_count, col_lo, col_hi))
+            eye_row_lo = r0_eye_px + int(row_lo)
+            eye_row_hi = r0_eye_px + int(row_hi)
+            if col_lo < w_left:
+                e_lo = c0_left_px + col_lo
+                e_hi = c0_left_px + min(col_hi, w_left)
+                self._vis_spikes_left.append((e_lo, e_hi, eye_row_lo, eye_row_hi, px_count))
+            if col_hi > w_left:
+                start = max(col_lo, w_left) - w_left
+                end = col_hi - w_left
+                e_lo = c0_right_px + start
+                e_hi = c0_right_px + end
+                self._vis_spikes_right.append((e_lo, e_hi, eye_row_lo, eye_row_hi, px_count))
+            spike_debug_lines.append((p, px_count))
 
+        # DEBUG print : marque M = passe le seuil esquive, P = passe pivot
+        if self.DEBUG and self._debug_decisions % self.DEBUG_EVERY_DECISIONS == 0:
+            min_pix = int(self.REPULSION_MIN_PIXELS)
+            piv_pix = int(self.REPULSION_PIVOT_PIXELS)
+            if spike_debug_lines:
+                spike_debug_lines.sort(key=lambda x: -x[1])
+                parts = []
+                for p, px in spike_debug_lines[:6]:
+                    mark = "P" if px >= piv_pix else ("M" if px >= min_pix else "")
+                    parts.append(f"({p:+.2f}:{px}{mark})")
+                print(
+                    f"[VIS-PEAKS d={self._debug_decisions:4d}] n={len(spike_debug_lines):2d} "
+                    f"thresh(M/P)={min_pix}/{piv_pix} " + " ".join(parts),
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[VIS-PEAKS d={self._debug_decisions:4d}] n=0 (aucun pic de prominence détecté)",
+                    flush=True,
+                )
+
+        # obs_size / obs_x legacy : stats agrégées du pic le plus impactant.
         size_raw = 0.0
         x_raw = 0.0
-        if all_spikes:
+        if detected_peaks:
             best_score = -1.0
-            best_center = w_p // 2
-            best_size = 0.0
-            for center, width, intensity in all_spikes:
-                pos = (center / float(max(1, w_p - 1))) * 2.0 - 1.0
-                centrality = 1.0 - pos * pos
-                # Score d'impact = largeur × intensité × centralité
-                score = float(width) * float(intensity) * float(centrality)
+            for p_blob, n_px, _cl, _ch, _rl, _rh in detected_peaks:
+                centrality = 1.0 - p_blob * p_blob
+                score = float(n_px) * float(centrality)
                 if score > best_score:
                     best_score = score
-                    best_center = center
-                    best_size = min(1.0, (float(width) * float(intensity)) / 10.0)
-            x_raw = (best_center / float(max(1, w_p - 1))) * 2.0 - 1.0
-            x_raw = float(np.clip(x_raw, -1.0, 1.0))
-            size_raw = float(best_size)
+                    x_raw = float(np.clip(p_blob, -1.0, 1.0))
+                    size_raw = min(1.0, float(n_px) / norm_px)
 
         # EMA
         ema = float(self.VIS_EMA)
@@ -1274,32 +1240,57 @@ class Controller:
                 c0 = int(w * self.VIS_ROI_C0_RIGHT)
                 c1 = int(w * self.VIS_ROI_C1_RIGHT)
 
-            img01 = raw.astype(np.float32) / 255.0
-            spike_roi = self._eye_spike_mask(img01, eye)
-
             base = (raw.astype(np.float32) * 0.45).astype(np.uint8)
             overlay = base.copy()
             roi_view = overlay[r0:r1, c0:c1, :]
 
-            # Visualiser également le masque d'arêtes verticales (jaune pâle)
-            # pour distinguer la détection brute (arêtes) du résultat (pics).
-            roi_rgb = img01[r0:r1, c0:c1]
-            edge_mask, _, _ = self._detect_vertical_edges(roi_rgb)
-            if edge_mask.shape == roi_view.shape[:2]:
-                yellow = np.array([220, 220, 60], dtype=np.float32)
-                roi_view[edge_mask] = (
-                    roi_view[edge_mask].astype(np.float32) * 0.5 + yellow * 0.5
-                ).astype(np.uint8)
+            # Ligne jaune sur le top de chaque silhouette (= "ce que la mouche voit
+            # comme contour foreground/background"). Calculé exactement comme dans
+            # _vision_step pour rester cohérent.
+            roi_rgb = raw[r0:r1, c0:c1, :].astype(np.float32) / 255.0
+            _silh_top, silh_h = self._compute_silhouette_top(roi_rgb)
+            roi_h = roi_view.shape[0]
+            roi_w = roi_view.shape[1]
+            yellow = np.array([220, 220, 60], dtype=np.uint8)
+            for col in range(roi_w):
+                row = int(_silh_top[col])
+                if 0 <= row < roi_h:
+                    roi_view[row, col, :] = yellow
 
-            if spike_roi.shape == roi_view.shape[:2]:
-                # Rouge vif : colonnes de pics détectés
-                roi_view[spike_roi] = np.array([255, 30, 30], dtype=np.uint8)
-
+            # Cadre cyan du ROI
             cyan = np.array([0, 220, 220], dtype=np.uint8)
             overlay[r0 : r0 + 1, c0:c1, :] = cyan
             overlay[r1 - 1 : r1, c0:c1, :] = cyan
             overlay[r0:r1, c0 : c0 + 1, :] = cyan
             overlay[r0:r1, c1 - 1 : c1, :] = cyan
+
+            # ROUGE : pics ACTUELLEMENT détectés par la détection silhouette-peaks
+            # (= ceux qui peuvent déclencher esquive). Coords IMAGE œil (déjà
+            # remappées dans _vision_step). Ligne rouge verticale sur le bbox
+            # du pic, du row_lo au row_hi, sur toute la largeur du bbox.
+            spike_list = self._vis_spikes_left if eye == "left" else self._vis_spikes_right
+            min_pix = int(self.REPULSION_MIN_PIXELS)
+            piv_pix = int(self.REPULSION_PIVOT_PIXELS)
+            for e_lo, e_hi, e_r_lo, e_r_hi, px in spike_list:
+                col_lo = max(0, min(int(e_lo), w - 1))
+                col_hi = max(col_lo + 1, min(int(e_hi), w))
+                row_lo = max(0, min(int(e_r_lo), h - 1))
+                row_hi = max(row_lo + 1, min(int(e_r_hi), h))
+                # Couleur selon seuil franchi :
+                #   rouge vif      = passe seuil PIVOT (esquive serrée)
+                #   orange         = passe seuil MIN  (esquive douce)
+                #   rose pâle      = détecté mais sous le seuil (info seulement)
+                if px >= piv_pix:
+                    col = np.array([255, 30, 30], dtype=np.uint8)
+                elif px >= min_pix:
+                    col = np.array([255, 140, 0], dtype=np.uint8)
+                else:
+                    col = np.array([220, 120, 160], dtype=np.uint8)
+                # Cadre rectangulaire 2px d'épaisseur
+                overlay[row_lo:row_lo+2, col_lo:col_hi, :] = col
+                overlay[row_hi-2:row_hi, col_lo:col_hi, :] = col
+                overlay[row_lo:row_hi, col_lo:col_lo+2, :] = col
+                overlay[row_lo:row_hi, col_hi-2:col_hi, :] = col
 
             out_eyes.append(overlay)
 

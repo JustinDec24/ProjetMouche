@@ -124,7 +124,7 @@ def main() -> None:
 
     if show_window:
         pygame.init()
-        display_size = (1536, 1536 if show_top_strip else 768)
+        display_size = (2200, 2200 if show_top_strip else 1100)
         screen = pygame.display.set_mode(display_size)
         cap = WINDOW_NAME + f"  level={args.level} seed={args.seed}"
         if args.debug_vision:
