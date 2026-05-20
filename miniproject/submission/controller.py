@@ -1776,3 +1776,4 @@ class Controller:
         result = np.concatenate(out_eyes, axis=1).astype(np.uint8)
         self._vis_debug_overlay = result
         return result
+
