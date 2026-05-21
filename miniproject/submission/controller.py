@@ -92,10 +92,10 @@ class Controller:
     # translation). On garde néanmoins deux exceptions à grip FORT LOCAL :
     #   - startup (stabilisation au spawn sur le terrain),
     #   - phase de recul head-collision (besoin de coller au sol pour reculer).
-    TERRAIN_GRIP_FORCE = 1.45   # kreslo : grip doux, pattes en appui
-    WIND_GRIP_FORCE = 1.80     # kreslo : vent, pattes en appui (ne fige pas la marche)
-    COLLISION_BACKUP_GRIP_FORCE = 6.0  # grip fort LOCAL pendant le recul head-collision
-    STARTUP_GRIP_FORCE = 14.0   # grip fort LOCAL pour stabiliser au spawn
+    TERRAIN_GRIP_FORCE = 12.0   # grip fort partout
+    WIND_GRIP_FORCE = 12.0      # grip fort partout (vent)
+    COLLISION_BACKUP_GRIP_FORCE = 12.0  # grip fort LOCAL pendant le recul head-collision (x2)
+    STARTUP_GRIP_FORCE = 28.0   # grip fort LOCAL pour stabiliser au spawn (x2)
     # Grip fort sur toutes les pattes pendant les N premiers SIM STEPS (pas
     # décisions), pour stabiliser la mouche dès le spawn sur le terrain.
     STARTUP_MAX_GRIP_STEPS = 7000   # 0.7 s @ timestep 1e-4
