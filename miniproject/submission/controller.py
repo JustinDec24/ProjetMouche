@@ -56,8 +56,8 @@ class Controller:
     TURN_MOD = 0.8
 
     # --- target steering (cap banane) ---
-    TARGET_STEER_GAIN = 3.0
-    TARGET_STEER_GAIN_CLOSE = 6.0
+    TARGET_STEER_GAIN = 3.3
+    TARGET_STEER_GAIN_CLOSE = 6.6
     TARGET_STEER_CLOSE_DIST = 24.0
     TARGET_STEER_BIAS_SCALE = 0.25
 
@@ -95,7 +95,7 @@ class Controller:
     TERRAIN_GRIP_FORCE = 1.45   # kreslo : grip doux, pattes en appui
     WIND_GRIP_FORCE = 1.80     # kreslo : vent, pattes en appui (ne fige pas la marche)
     COLLISION_BACKUP_GRIP_FORCE = 6.0  # grip fort LOCAL pendant le recul head-collision
-    STARTUP_GRIP_FORCE = 6.0    # grip fort LOCAL pour stabiliser au spawn
+    STARTUP_GRIP_FORCE = 14.0   # grip fort LOCAL pour stabiliser au spawn
     # Grip fort sur toutes les pattes pendant les N premiers SIM STEPS (pas
     # décisions), pour stabiliser la mouche dès le spawn sur le terrain.
     STARTUP_MAX_GRIP_STEPS = 7000   # 0.7 s @ timestep 1e-4
@@ -111,19 +111,15 @@ class Controller:
     # bi-oculaire fusionnée en un seul vecteur de colonnes couvrant le frontal-large.
     VISION_ENABLE = True
 
-    # ROI vertical : bande horizon (haut = sky/cloud, bas = sol/grass)
-    VIS_ROI_R0 = 0.05
-    VIS_ROI_R1 = 0.78
-
-    # ROI horizontal par œil : zone fronto-nasale élargie à 70%.
-    # Œil gauche : moitié droite de l'image (cols hautes = côté nasal = vers l'avant).
-    # Œil droit  : moitié gauche de l'image (cols basses = côté nasal).
-    # Quand on concatène [left_ROI | right_ROI], le centre du panorama tombe
-    # exactement sur le frontal binoculaire = "pile en face".
-    VIS_ROI_C0_LEFT = 0.45
-    VIS_ROI_C1_LEFT = 0.98
-    VIS_ROI_C0_RIGHT = 0.02
-    VIS_ROI_C1_RIGHT = 0.55
+    # ROI = vision raw COMPLÈTE (pas de crop). Chaque œil utilise toute
+    # sa rétine pour la détection. Le panorama bi-oculaire concaténé couvre
+    # alors le champ visuel total des deux yeux.
+    VIS_ROI_R0 = 0.0
+    VIS_ROI_R1 = 1.0
+    VIS_ROI_C0_LEFT = 0.0
+    VIS_ROI_C1_LEFT = 1.0
+    VIS_ROI_C0_RIGHT = 0.0
+    VIS_ROI_C1_RIGHT = 1.0
 
     # EMA pour stabilité du signal (bas = lissage plus fort, anti-wind sway)
     VIS_EMA = 0.30
@@ -283,7 +279,7 @@ class Controller:
             for _jnt in range(sim.mj_model.njnt):
                 if sim.mj_model.jnt_type[_jnt] == _mj.mjtJoint.mjJNT_FREE:
                     _addr = sim.mj_model.jnt_qposadr[_jnt]
-                    sim.mj_data.qpos[_addr + 2] += 0.4
+                    sim.mj_data.qpos[_addr + 2] += 0.1
                     _mj.mj_forward(sim.mj_model, sim.mj_data)
                     break
         except Exception:
@@ -721,9 +717,23 @@ class Controller:
                 self._align_left = 0
             else:
                 self._align_left -= 1
+                _slope_forward = 0.0
+                _slope_lateral = 0.0
+                _slope_mag = 0.0
                 if self._enable_terrain:
                     max_drive = float(self.ALIGN_MAX_DRIVE_TERRAIN)
                     min_side = float(self.ALIGN_MIN_SIDE_TERRAIN)
+                    # Slope-adapt : sur pente forte, on freine le max_drive
+                    # pour éviter que le pivot HARD ne fasse basculer la mouche.
+                    try:
+                        _slope_forward, _slope_lateral, _slope_mag = self._get_slope_signals(sim)
+                    except Exception:
+                        pass
+                    if _slope_mag > 0.0:
+                        brake = 1.0 / (
+                            1.0 + float(self.STEEP_BRAKE) * float(_slope_mag)
+                        )
+                        max_drive = max(min_side, max_drive * brake)
                 else:
                     max_drive = float(self.MAX_DRIVE)
                     min_side = float(self.MIN_SIDE_DRIVE)
@@ -731,6 +741,19 @@ class Controller:
                     drives = np.array([min_side, max_drive], dtype=float)
                 else:
                     drives = np.array([max_drive, min_side], dtype=float)
+                # Slope-bias additif : compense la dérive latérale due à la pente
+                # en boostant la roue uphill et réduisant la roue downhill.
+                if self._enable_terrain and _slope_mag > 0.0:
+                    downhill = max(0.0, -_slope_forward)
+                    slope_bias = -float(self.SLOPE_STEER_GAIN) * float(_slope_lateral) * float(downhill)
+                    slope_bias = float(np.clip(
+                        slope_bias, -float(self.SLOPE_STEER_MAX), float(self.SLOPE_STEER_MAX),
+                    ))
+                    # Scale conservatif (0.15) pour ne pas dominer le pivot ALIGN
+                    slope_diff = 0.15 * slope_bias
+                    drives[0] += slope_diff
+                    drives[1] -= slope_diff
+                    drives = np.clip(drives, 0.0, max_drive)
                 if (
                     self.DEBUG
                     and self._debug_decisions <= self.DEBUG_MAX_DECISIONS
