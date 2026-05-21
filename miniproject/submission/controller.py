@@ -273,13 +273,94 @@ class Controller:
         except Exception:
             self._banana_xy = None
 
-        # Lift fly at spawn to free legs from terrain mesh.
+        # Lift fly at spawn + aligne le corps SUR LA PENTE (z_body = normale
+        # terrain au point de spawn). Préserve le yaw initial choisi par le sim.
+        # Le free joint stocke qpos = [x, y, z, qw, qx, qy, qz].
         try:
             import mujoco as _mj
             for _jnt in range(sim.mj_model.njnt):
                 if sim.mj_model.jnt_type[_jnt] == _mj.mjtJoint.mjJNT_FREE:
                     _addr = sim.mj_model.jnt_qposadr[_jnt]
+                    spawn_x = float(sim.mj_data.qpos[_addr + 0])
+                    spawn_y = float(sim.mj_data.qpos[_addr + 1])
+                    # Lift
                     sim.mj_data.qpos[_addr + 2] += 0.1
+
+                    # Yaw initial (rotation autour de Z monde)
+                    qw = float(sim.mj_data.qpos[_addr + 3])
+                    qx = float(sim.mj_data.qpos[_addr + 4])
+                    qy = float(sim.mj_data.qpos[_addr + 5])
+                    qz = float(sim.mj_data.qpos[_addr + 6])
+                    yaw = float(np.arctan2(
+                        2.0 * (qw * qz + qx * qy),
+                        1.0 - 2.0 * (qy * qy + qz * qz),
+                    ))
+
+                    # Normale du terrain au spawn (Z_body cible)
+                    n = np.array([0.0, 0.0, 1.0], dtype=float)
+                    world = getattr(sim, "world", None)
+                    get_normal = getattr(world, "get_normal", None)
+                    if callable(get_normal):
+                        try:
+                            nn = np.asarray(get_normal(spawn_x, spawn_y), dtype=float)
+                            if nn.shape == (3,) and np.isfinite(nn).all():
+                                nnorm = float(np.linalg.norm(nn))
+                                if nnorm > 1e-9:
+                                    n = nn / nnorm
+                        except Exception:
+                            pass
+
+                    # X_body = projection du forward yaw sur le plan perpendiculaire à n
+                    forward_world = np.array([
+                        float(np.cos(yaw)),
+                        float(np.sin(yaw)),
+                        0.0,
+                    ])
+                    x_body = forward_world - float(np.dot(forward_world, n)) * n
+                    xn = float(np.linalg.norm(x_body))
+                    if xn < 1e-6:
+                        # Cas dégénéré : forward parallèle à n → fallback identité
+                        x_body = np.array([1.0, 0.0, 0.0])
+                    else:
+                        x_body = x_body / xn
+                    # Y_body = n × x_body (left-handed body frame standard)
+                    y_body = np.cross(n, x_body)
+                    yn = float(np.linalg.norm(y_body))
+                    if yn > 1e-9:
+                        y_body = y_body / yn
+                    # Matrice 3x3 : colonnes = (x_body, y_body, n)
+                    R = np.column_stack([x_body, y_body, n])
+                    # Conversion matrice → quaternion (algo standard)
+                    tr = float(R[0, 0] + R[1, 1] + R[2, 2])
+                    if tr > 0.0:
+                        S = 2.0 * float(np.sqrt(tr + 1.0))
+                        new_qw = 0.25 * S
+                        new_qx = (R[2, 1] - R[1, 2]) / S
+                        new_qy = (R[0, 2] - R[2, 0]) / S
+                        new_qz = (R[1, 0] - R[0, 1]) / S
+                    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+                        S = 2.0 * float(np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]))
+                        new_qw = (R[2, 1] - R[1, 2]) / S
+                        new_qx = 0.25 * S
+                        new_qy = (R[0, 1] + R[1, 0]) / S
+                        new_qz = (R[0, 2] + R[2, 0]) / S
+                    elif R[1, 1] > R[2, 2]:
+                        S = 2.0 * float(np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]))
+                        new_qw = (R[0, 2] - R[2, 0]) / S
+                        new_qx = (R[0, 1] + R[1, 0]) / S
+                        new_qy = 0.25 * S
+                        new_qz = (R[1, 2] + R[2, 1]) / S
+                    else:
+                        S = 2.0 * float(np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]))
+                        new_qw = (R[1, 0] - R[0, 1]) / S
+                        new_qx = (R[0, 2] + R[2, 0]) / S
+                        new_qy = (R[1, 2] + R[2, 1]) / S
+                        new_qz = 0.25 * S
+
+                    sim.mj_data.qpos[_addr + 3] = float(new_qw)
+                    sim.mj_data.qpos[_addr + 4] = float(new_qx)
+                    sim.mj_data.qpos[_addr + 5] = float(new_qy)
+                    sim.mj_data.qpos[_addr + 6] = float(new_qz)
                     _mj.mj_forward(sim.mj_model, sim.mj_data)
                     break
         except Exception:
@@ -400,6 +481,11 @@ class Controller:
             in_startup_grip = self._step_count < int(self.STARTUP_MAX_GRIP_STEPS)
             if in_startup_grip:
                 grip_val = float(self.STARTUP_GRIP_FORCE)
+                # Fix L3/L4 : pendant le startup avec vent, on prend le max
+                # pour ne pas être en-dessous du grip vent normal (sinon la
+                # mouche se fait souffler dès le spawn).
+                if self._enable_wind:
+                    grip_val = max(grip_val, float(self.WIND_GRIP_FORCE))
             elif in_collision_backup:
                 grip_val = float(self.COLLISION_BACKUP_GRIP_FORCE)
             elif self._enable_wind:
