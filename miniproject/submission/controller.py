@@ -49,24 +49,22 @@ class Controller:
     ANTENNA_WEIGHT = 1
     EPS_ODOR = 1e-12
     STOP_ODOR_THRESHOLD = 5e-3          # stop quand mean_odor > seuil = au but
+    # EMA temporel sur les capteurs olfactifs bruts. Sous vent random
+    # (changement d'angle toutes les 100 ms, uniform 0-360°), le plume
+    # balaie toutes les directions ; moyenner ~1.5 s récupère la concentration
+    # time-averaged qui est isotrope (radiale, centrée sur la banane).
+    # α = 0.017 → τ ≈ 1.5 s à 40 Hz (DECISION_INTERVAL_S = 0.025).
+    # Activé UNIQUEMENT sur niveaux avec vent (L3/L4). Sans vent, le plume
+    # est déjà stable et lisser ralentirait inutilement la réactivité.
+    ODOR_EMA_ALPHA_WIND = 0.017
     # Stop physique (ground-truth banana_xy) : sécurité finale. La navigation
     # reste 100% olfactive, banana_xy n'est utilisé QUE pour ce critère d'arrêt.
     STOP_DIST = 2.0                     # mm
     # Gain "attractif" du notebook (signe négatif = source attractive).
     OLF_ATTRACTIVE_GAIN = -500.0
-    # EMA sur le signal olfactif brut (exercice 2 du notebook week4).
-    # alpha haut = réagit vite ; bas = très lisse.
-    # Sans vent : 0.3 — bon compromis pour stabiliser l'asymétrie L/R près de
-    # la source (sinon elle flippe vite et la mouche oscille / passe à côté).
-    # Avec vent : 0.017 (τ ≈ 1.5 s à 40 Hz) — le sim randomise l'angle du
-    # vent toutes les 100 ms ; en moyennant ~10-15 cycles, on récupère le
-    # plume time-averaged qui est isotrope (comme sans vent).
-    ODOR_EMA_ALPHA = 0.3
-    ODOR_EMA_ALPHA_WIND = 0.017
     # effective_norm → target_bias : tanh(target_bias) sera ensuite calculé
-    # côté downstream, donc 5.0 ⇒ tanh à ±0.99991 (turn quasi totalement
-    # asymétrique). Augmenté de 3.0 → 5.0 pour booster le pull banane.
-    OLF_TARGET_BIAS_SCALE = 5.0
+    # côté downstream, donc 3.0 ⇒ tanh saturé à ±0.995.
+    OLF_TARGET_BIAS_SCALE = 3.0
     # Amplification raw_asym → bearing. NOTE : à distance (~30 mm), raw_asym
     # est tout petit (~0.03) ET son signe est bruité. Amplifier (ex K=10) fait
     # qu'ALIGN engage un pivot dur dans une direction potentiellement fausse
@@ -74,28 +72,12 @@ class Controller:
     # tout droit. K=1 (pas d'amplification) ⇒ ALIGN exit immédiat, la mouche
     # avance et la chimiotaxie corrige la trajectoire en mode GO.
     OLF_BEARING_GAIN = 1.0
-    # À courte distance (mean_odor > ODOR_CLOSE_THRESHOLD), raw_asym devient
-    # plus grand et son signe est fiable. On amplifie alors le bearing pour
-    # déclencher GO_PIVOT dès une petite déviation → turn radius serré.
-    OLF_BEARING_GAIN_CLOSE = 5.0
     # Seuils de proximité (en mean_odor) — remplacent dist_to_banana :
     ODOR_CLOSE_THRESHOLD = 1e-5         # mean_odor > X → gain serré (TARGET_STEER_GAIN_CLOSE)
     ODOR_SPRINT_THRESHOLD = 1e-4        # mean_odor > X → sprint final (pas de répulsion)
 
-    # --- "passing by" detector (demi-tour quand l'odeur chute après pic) ---
-    # Stratégie de chimiotaxie biologique : si on est passé près de la source
-    # et qu'on s'en éloigne, l'odeur perçue chute brutalement → demi-tour.
-    UTURN_ENABLE = True
-    UTURN_PEAK_MIN = 5e-7               # pic min atteint pour déclencher (= on a été proche)
-    UTURN_DROP_RATIO = 0.5              # mean_odor < pic × ratio → trigger
-    UTURN_DECISIONS = 35                # durée du demi-tour (~0.9 s)
-    UTURN_COOLDOWN = 25                 # décisions de cooldown post-demi-tour
-
     # --- drives ---
     BASE_DRIVE_FAST = 2.40
-    # Vitesse réduite quand l'odeur est forte (mean_odor > ODOR_SPRINT_THRESHOLD)
-    # pour que la mouche puisse virer serré sans overshoot dans le dernier mm.
-    BASE_DRIVE_CLOSE = 1.20
     MAX_DRIVE = 2.80
     MAX_DRIVE_TERRAIN = 2.00
     MIN_DRIVE = 0.80
@@ -103,8 +85,6 @@ class Controller:
     MIN_SIDE_DRIVE = 0.40
     MIN_SIDE_DRIVE_TERRAIN = 0.25
     TURN_MOD = 0.8
-    # Modulation accrue quand on est proche → asymétrie quasi totale.
-    TURN_MOD_CLOSE = 1.0
 
     # --- target steering (cap banane) ---
     TARGET_STEER_GAIN = 4.0
@@ -342,13 +322,9 @@ class Controller:
         except Exception:
             self._banana_xy = None
 
-        # État EMA olfactif (tableau (n_sensors × n_odor_dim) lissé).
-        self._odor_smooth = None
-        # "Passing by" detector
-        self._odor_peak = 0.0              # max mean_odor observé (running)
-        self._uturn_left = 0               # décisions restantes en demi-tour
-        self._uturn_dir = 0.0              # ±1 = côté du pivot
-        self._uturn_cooldown = 0           # décisions de cooldown
+        # EMA des capteurs olfactifs (None = pas encore initialisé).
+        # Utilisée seulement quand self._enable_wind (cf. _read_olfaction).
+        self._odor_ema = None
 
         # NOTE : sim.world.banana_xy interdit. Navigation = olfaction uniquement.
 
@@ -736,28 +712,27 @@ class Controller:
           raw_asym, effective_norm > 0 ⇔ banane à DROITE (index 1)
         """
         try:
-            raw = np.asarray(sim.get_olfaction(sim.fly.name), dtype=float)
+            odor_intensities = np.asarray(sim.get_olfaction(sim.fly.name), dtype=float)
         except Exception:
             return 0.0, 0.0, 0.0
-        if raw.size < 4:
+        if odor_intensities.size < 4:
             return 0.0, 0.0, 0.0
-        # EMA sur le brut (cf. exercice 2 du notebook week4) avant calcul des
-        # asymétries. Lisse le bruit qui fait flipper raw_asym près de la source.
-        # En présence de vent, alpha plus petit (~0.017 → τ ≈ 1.5 s) pour
-        # moyenner les ~10-15 cycles de rotation du plume et recouvrer un
-        # signal isotrope ; sans vent, alpha standard (~0.3).
-        if self._odor_smooth is None:
-            self._odor_smooth = raw.copy()
+        # EMA temporel en présence de vent : le plume tourne très vite (sim
+        # randomise l'angle toutes les 100 ms) ; moyenner ~1.5 s récupère le
+        # plume "time-averaged" qui est isotrope et exploitable comme sans vent.
+        if self._enable_wind:
+            if self._odor_ema is None:
+                self._odor_ema = odor_intensities.copy()
+            else:
+                a = float(self.ODOR_EMA_ALPHA_WIND)
+                self._odor_ema = (1.0 - a) * self._odor_ema + a * odor_intensities
+            odor_for_formula = self._odor_ema
         else:
-            a = float(
-                self.ODOR_EMA_ALPHA_WIND if self._enable_wind else self.ODOR_EMA_ALPHA
-            )
-            self._odor_smooth = (1.0 - a) * self._odor_smooth + a * raw
-        odor_intensities = self._odor_smooth
+            odor_for_formula = odor_intensities
         # Canal 0 = attractif (banane). reshape (2,2) → [[palp0, palp1], [ant0, ant1]]
         # weighted avg axis=0 → [9·palp0 + ant0, 9·palp1 + ant1] / 10
         attractive_intensities = np.average(
-            odor_intensities[:, 0].reshape(2, 2),
+            odor_for_formula[:, 0].reshape(2, 2),
             axis=0,
             weights=[float(self.PALP_WEIGHT), float(self.ANTENNA_WEIGHT)],
         )
@@ -793,14 +768,7 @@ class Controller:
         # Amplifie raw_asym (typiquement ~0.03 au spawn) avant scaling angulaire,
         # puis clip à ±1 pour borner |bearing| ≤ π/2. Garde la proportionnalité
         # (bearing→0 quand asym→0) mais avec une dynamique utilisable par ALIGN.
-        # Gain ↑ quand on est proche : raw_asym plus grand et fiable → on veut
-        # déclencher GO_PIVOT dès une petite déviation pour rester sur la cible.
-        gain = (
-            float(self.OLF_BEARING_GAIN_CLOSE)
-            if mean_odor > float(self.ODOR_CLOSE_THRESHOLD)
-            else float(self.OLF_BEARING_GAIN)
-        )
-        scaled = float(np.clip(raw_asym * gain, -1.0, 1.0))
+        scaled = float(np.clip(raw_asym * float(self.OLF_BEARING_GAIN), -1.0, 1.0))
         bearing = -scaled * (np.pi / 2.0)
         return target_bias, bearing
 
@@ -837,58 +805,6 @@ class Controller:
             return np.array([0.0, 0.0])
         # Proxies utilisés à la place de dist_to_banana.
         close_to_banana = mean_odor > float(self.ODOR_SPRINT_THRESHOLD)
-
-        # ---- "Passing by" detector : demi-tour si odeur chute après pic ----
-        # On track le pic d'odeur, et si l'odeur courante chute brutalement
-        # sous une fraction du pic, on déduit qu'on vient de passer à côté
-        # de la banane → demi-tour serré pour revenir dessus.
-        if self.UTURN_ENABLE:
-            # Update peak (suspended pendant le U-turn lui-même)
-            if self._uturn_left == 0:
-                self._odor_peak = max(self._odor_peak, mean_odor)
-
-            # Cooldown post-demi-tour
-            if self._uturn_cooldown > 0:
-                self._uturn_cooldown -= 1
-
-            # Trigger : on a été proche (peak ≥ UTURN_PEAK_MIN) et l'odeur a chuté
-            if (
-                self._uturn_left == 0
-                and self._uturn_cooldown == 0
-                and self._odor_peak >= float(self.UTURN_PEAK_MIN)
-                and mean_odor < self._odor_peak * float(self.UTURN_DROP_RATIO)
-            ):
-                # Direction du pivot : signe de effective_norm (dernier côté banane).
-                # +1 = banane à DROITE → pivot droite (drives=[max,min]).
-                # -1 = banane à GAUCHE → pivot gauche (drives=[min,max]).
-                # Si effective_norm ≈ 0 (banane pile derrière), choisir +1 par défaut.
-                sign_en = float(np.sign(effective_norm)) if abs(effective_norm) > 0.5 else 1.0
-                self._uturn_dir = sign_en
-                self._uturn_left = int(self.UTURN_DECISIONS)
-                print(
-                    f"[UTURN d={self._debug_decisions}] peak={self._odor_peak:.2e} "
-                    f"mean_odor={mean_odor:.2e} dir={'R' if sign_en > 0 else 'L'}",
-                    flush=True,
-                )
-
-            # Exécution du demi-tour
-            if self._uturn_left > 0:
-                self._uturn_left -= 1
-                if self._enable_terrain:
-                    pmax = float(self.ALIGN_MAX_DRIVE_TERRAIN)
-                    pmin = float(self.ALIGN_MIN_SIDE_TERRAIN)
-                else:
-                    pmax = float(self.MAX_DRIVE)
-                    pmin = float(self.MIN_SIDE_DRIVE)
-                if self._uturn_dir > 0:
-                    drives_uturn = np.array([pmax, pmin], dtype=float)
-                else:
-                    drives_uturn = np.array([pmin, pmax], dtype=float)
-                # Quand le U-turn finit : cooldown + reset peak sur l'instant
-                if self._uturn_left == 0:
-                    self._uturn_cooldown = int(self.UTURN_COOLDOWN)
-                    self._odor_peak = mean_odor  # repart de l'odeur courante
-                return drives_uturn
 
         # ---- stuck detection / escape (terrain trap) ----
         moved = float("inf")
@@ -1097,13 +1013,9 @@ class Controller:
         # AVOID. Si on est proche de la banane (odeur forte), GO direct.
         # `close_to_banana` est déjà calculé plus haut depuis mean_odor.
 
-        # Zone "approche finale" (odeur déjà perceptible, ~5-10 mm) :
-        # ralentissement progressif + asymétrie maximale pour virages serrés.
-        approach_zone = mean_odor > float(self.ODOR_CLOSE_THRESHOLD)
-
         if close_to_banana:
             bias = float(target_bias)
-            base_drive = float(self.BASE_DRIVE_CLOSE)
+            base_drive = float(self.BASE_DRIVE_FAST)
             sub_mode = "GO"
         else:
             rep_bias, rep_base, rep_mode, _rep_active = self._compute_repulsion_bias(
@@ -1193,15 +1105,7 @@ class Controller:
             self._go_pivot_active = False
 
         # ---- Terrain (slope) ----
-        # Modulation accrue dès la zone d'approche finale = virage quasi sur place
-        # (déclenché par odeur, pas par banana_xy).
-        turn_mod = (
-            float(self.TURN_MOD_CLOSE) if approach_zone else float(self.TURN_MOD)
-        )
-        # Ralentit dès la zone d'approche, pas seulement à la zone sprint, pour
-        # éviter de filer en tangente devant la banane.
-        if approach_zone and not close_to_banana:
-            base_drive = min(base_drive, float(self.BASE_DRIVE_CLOSE))
+        turn_mod = self.TURN_MOD
         slope_mag = 0.0
         if self._enable_terrain:
             slope_forward, slope_lateral, slope_mag = self._get_slope_signals(sim)
