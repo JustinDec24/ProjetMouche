@@ -57,6 +57,18 @@ class Controller:
     # Activé UNIQUEMENT sur niveaux avec vent (L3/L4). Sans vent, le plume
     # est déjà stable et lisser ralentirait inutilement la réactivité.
     ODOR_EMA_ALPHA_WIND = 0.017
+    # D1 — noise floor sur raw_asym : tout signal |raw_asym| < seuil est mis à 0.
+    # Évite que la mouche réagisse au jitter numérique près de la source ou en
+    # bordure de zone (le sim a une précision finie, raw_asym peut osciller
+    # ~±1e-4 sans raison physique). Baissé 0.005 → 0.001 : laisse passer les
+    # petits signaux exploitables (les capteurs L/R diffèrent réellement à
+    # ~0.5% au spawn quand la mouche est perpendiculaire à la source).
+    NOISE_FLOOR_ASYM = 0.001
+    # A4 — damping dérivatif sur target_bias. Quand raw_asym change vite
+    # (= la mouche est en train de "croiser" l'axe banane), réduit le pull
+    # vers la source pour amortir l'overshoot. damping = 1/(1 + K_d × |Δasym|).
+    # K_d = 50 : un Δasym de 0.1 entre 2 décisions divise target_bias par ~6.
+    ASYM_DAMPING_GAIN = 50.0
     # Stop physique (ground-truth banana_xy) : sécurité finale. La navigation
     # reste 100% olfactive, banana_xy n'est utilisé QUE pour ce critère d'arrêt.
     STOP_DIST = 2.0                     # mm
@@ -74,7 +86,11 @@ class Controller:
     OLF_BEARING_GAIN = 1.0
     # Seuils de proximité (en mean_odor) — remplacent dist_to_banana :
     ODOR_CLOSE_THRESHOLD = 1e-5         # mean_odor > X → gain serré (TARGET_STEER_GAIN_CLOSE)
-    ODOR_SPRINT_THRESHOLD = 1e-4        # mean_odor > X → sprint final (pas de répulsion)
+    # Baissé de 1e-4 à 5e-6 : la mouche atteignait rarement 1e-4 avant de
+    # s'éloigner (mean_odor ~5e-6 à ~10 mm de la banane). Désactiver la
+    # répulsion vision plus tôt = elle peut foncer sur la banane sans être
+    # déviée par les herbes proches de la cible.
+    ODOR_SPRINT_THRESHOLD = 5e-6        # mean_odor > X → sprint final (pas de répulsion)
 
     # --- drives ---
     BASE_DRIVE_FAST = 2.40
@@ -197,7 +213,12 @@ class Controller:
     REPULSION_FALLOFF_ALPHA = 1.2          # exp(-alpha × p²) : étendue plus large
     REPULSION_CENTRAL_EPS = 0.12           # zone "central" un peu plus large
     REPULSION_CENTRAL_BOOST = 200          # gros boost central
-    REPULSION_BANANA_BLEND = 0.50          # pull banane très forte pendant l'esquive
+    # Augmenté 0.50 → 1.00 : à mi-chemin (10-25 mm), le pull olfactif (saturé
+    # à ±3) était divisé par 2 alors que la répulsion vision peut atteindre 12.
+    # → la mouche se faisait dévier par les herbes du champ. Avec blend = 1.0,
+    # le pull olfactif compte plein, la répulsion garde son rôle d'évitement
+    # immédiat mais ne fait plus dérailler la trajectoire vers la banane.
+    REPULSION_BANANA_BLEND = 1.00          # pull banane à pleine force pendant l'esquive
 
     # === Seuils en pixels verts (taille apparente du pic) ===
     # Augmentés pour ne réagir qu'aux pics suffisamment proches/menaçants.
@@ -325,6 +346,8 @@ class Controller:
         # EMA des capteurs olfactifs (None = pas encore initialisé).
         # Utilisée seulement quand self._enable_wind (cf. _read_olfaction).
         self._odor_ema = None
+        # raw_asym de la décision précédente (pour le terme dérivatif A4).
+        self._raw_asym_prev = 0.0
 
         # NOTE : sim.world.banana_xy interdit. Navigation = olfaction uniquement.
 
@@ -741,6 +764,9 @@ class Controller:
             return 0.0, 0.0, 0.0
         diff = float(attractive_intensities[0] - attractive_intensities[1])
         raw_asym = diff / mean_odor                                # ∈ [-2, +2] en pratique
+        # D1 — noise floor : ignorer le jitter numérique sous le seuil.
+        if abs(raw_asym) < float(self.NOISE_FLOOR_ASYM):
+            raw_asym = 0.0
         attractive_bias = float(self.OLF_ATTRACTIVE_GAIN) * raw_asym
         effective_norm = float(np.tanh(attractive_bias ** 2) * np.sign(attractive_bias))
         return mean_odor, effective_norm, float(raw_asym)
@@ -764,7 +790,15 @@ class Controller:
           bearing     > 0 → banane à GAUCHE (signe opposé à target_bias)
         """
         mean_odor, effective_norm, raw_asym = self._read_olfaction(sim)
-        target_bias = float(effective_norm) * float(self.OLF_TARGET_BIAS_SCALE)
+        # A4 — damping dérivatif : quand raw_asym change vite (croisement
+        # d'axe banane), réduit le pull pour amortir l'overshoot.
+        # damping = 1 / (1 + K_d × |Δasym|) ∈ (0, 1].
+        d_asym = float(raw_asym) - float(self._raw_asym_prev)
+        self._raw_asym_prev = float(raw_asym)
+        damping = 1.0 / (1.0 + float(self.ASYM_DAMPING_GAIN) * abs(d_asym))
+        target_bias = (
+            float(effective_norm) * float(self.OLF_TARGET_BIAS_SCALE) * damping
+        )
         # Amplifie raw_asym (typiquement ~0.03 au spawn) avant scaling angulaire,
         # puis clip à ±1 pour borner |bearing| ≤ π/2. Garde la proportionnalité
         # (bearing→0 quand asym→0) mais avec une dynamique utilisable par ALIGN.
@@ -940,8 +974,27 @@ class Controller:
                     self._align_initial_sign = float(np.sign(effective_norm))
                     self._align_left = int(self.ALIGN_MAX_DECISIONS)
                 else:
-                    # Pas de signal exploitable au spawn → on saute ALIGN
-                    self._align_done = True
+                    # Pas de signal exploitable au spawn (|effective_norm|<0.5)
+                    # → NE PAS skip ALIGN. On avance doucement en ligne droite
+                    # (drives symétriques bas) pour laisser le temps à l'asym
+                    # de se déclarer. Dès qu'on aura un signal clair à une
+                    # décision suivante, ALIGN s'engagera correctement.
+                    if self._enable_terrain:
+                        base_lo = float(self.ALIGN_MAX_DRIVE_TERRAIN) * 0.5
+                    else:
+                        base_lo = float(self.MAX_DRIVE) * 0.5
+                    if (
+                        self.DEBUG
+                        and self._debug_decisions <= self.DEBUG_MAX_DECISIONS
+                        and (self._debug_decisions % self.DEBUG_EVERY_DECISIONS == 0)
+                    ):
+                        print(
+                            f"[dbg d={self._debug_decisions:4d}] mode=ALIGN-SEARCH "
+                            f"eff_norm={effective_norm:+.3f} odor={mean_odor:.2e} "
+                            f"drives=({base_lo:.3f},{base_lo:.3f})",
+                            flush=True,
+                        )
+                    return np.array([base_lo, base_lo], dtype=float)
 
             # Sortie : signe d'effective_norm s'inverse (dépassé l'axe banane)
             # OU effective_norm devient nul (parfaitement aligné, rare en pratique)
