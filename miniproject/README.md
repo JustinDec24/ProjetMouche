@@ -1,49 +1,109 @@
-# Miniproject for BIOENG-456: Controlling behavior in animals and robots
+# Miniproject CoBAR 2026 — Controlling a fly via olfaction
 
-Welcome to the Miniproject for BIOENG-456!
+Contrôleur biomimétique pour la mouche du projet BIOENG-456. La navigation vers
+la banane est **100 % olfactive** (les coordonnées de la cible ne sont jamais
+utilisées pour décider du cap ; seul un critère d'arrêt physique à 2 mm les lit).
 
-## Setup
-Run `uv sync` to make sure you have all the dependencies installed
-```bash
+Pour la description détaillée du pipeline interne, voir [`SUBMISSION.md`](SUBMISSION.md).
+
+## 1. Installation
+
+Dépendances gérées par `uv` (voir le README racine pour installer `uv`, Git et
+FFmpeg).
+
+```sh
+# Depuis la racine du repo
 uv sync
 ```
 
-## Usage
+Cette commande crée `.venv/` et installe tous les paquets nécessaires (`flygym`,
+`mujoco`, `pygame`, `numpy`, etc.).
 
-To explore the levels interactively with the keyboard, run the `run_interactive.py` script. Then you can use the WASD keys to control the fly (Q to stop and ESC to exit).
+## 2. Lancer le contrôleur sur un niveau
 
-```bash
-uv run miniproject/run_interactive.py --level <level> --seed <seed>
-```
+### Windows (PowerShell / cmd)
 
-Replace `<level>` with the desired level number (0 to 4 for the 5 levels) and `<seed>` with the random seed for reproducibility.
-
-If you want to see the fly's vision as well, add the `--render-fly-vision` argument.
-
-> If you have an issue with the rendering (black screen - mainly seen on linux), you can try to add the argument `--dont-use-pygame-rendering` to fallback to opencv rendering instead of pygame. Note: first you will have to run `uv pip install pynput` to get the pynput library.
-
-The `run_simulation.ipynb` notebook contains code that will be used to evaluate the controller.
-
-## Creating a private copy while keeping track of the changes from the public repository
-1. Clone this repository
 ```sh
-git clone https://github.com/NeLy-EPFL/cobar-2026 cobar-miniproject-2026
-cd cobar-miniproject-2026
+.\.venv\Scripts\python.exe miniproject/run_with_controller.py --level 2 --seed 42
 ```
-2. Create a New Private Repository on GitHub:
-- Go to GitHub and create a new private repository.
-- Do not initialize it with a README, .gitignore, or any other files.
-3. Set the New Private Repository as a Remote:
+
+### macOS / Linux
+
 ```sh
-git remote rename origin upstream
-git remote add origin https://github.com/<your_username>/cobar-miniproject-2026
+.venv/bin/python miniproject/run_with_controller.py --level 2 --seed 42
 ```
-4. Push the Cloned Repository to Your Private Repository:
+
+Une fenêtre `pygame` s'ouvre avec la vue caméra et l'overlay choisi. Elle est
+automatiquement bornée à ~90 % du moniteur (ratio préservé).
+
+**Touches dans la fenêtre :**
+- `ESPACE` → reset la simulation
+- `ÉCHAP` → quitter
+
+## 3. Options CLI
+
 ```sh
-git push -u origin main
+.venv/bin/python miniproject/run_with_controller.py --level <N> --seed <N> [options]
 ```
-5. We will notify you if there are important changes to the repository. To fetch updates from the public repository and merge them into your private repository, use the following commands:
+
+| Option | Effet |
+|---|---|
+| `--level N` | Difficulté : `0` plat, `1` +terrain, `2` +gazon, `3` +vent, `4` +libellule |
+| `--seed N` | Graine aléatoire (défaut 42) |
+| `--max-steps N` | Cap sur le nombre de pas physiques (défaut 100 000 ≈ 10 s simulés) |
+| `--no-display` | Mode headless (pas de fenêtre), utile pour benchmarker |
+| `--render-fly-vision` | Affiche la vision brute (œil gauche + œil droit) au-dessus des caméras |
+| `--debug-vision` | Affiche l'overlay de détection vision (silhouette + bbox du pic ciblé) |
+| `--progress-every N` | Imprime une ligne de progrès tous les N pas (0 désactive) |
+
+`--debug-vision` a la priorité sur `--render-fly-vision` si les deux sont passés.
+
+## 4. Exemples
+
 ```sh
-git fetch upstream
-git merge upstream/main
+# L0 (arène plate), seed 1, fenêtre standard
+.venv/bin/python miniproject/run_with_controller.py --level 0 --seed 1
+
+# L2 (gazon), avec overlay vision pour voir ce que la mouche détecte
+.venv/bin/python miniproject/run_with_controller.py --level 2 --seed 67 --debug-vision
+
+# L4 (le plus dur), headless, max 200 000 steps, log tous les 10 000
+.venv/bin/python miniproject/run_with_controller.py \
+    --level 4 --seed 777 --no-display --max-steps 200000 --progress-every 10000
 ```
+
+## 5. Mode interactif (clavier)
+
+Pour piloter manuellement la mouche au clavier (utile pour explorer un niveau) :
+
+```sh
+.venv/bin/python miniproject/run_interactive.py --level 2 --seed 42
+```
+
+Touches : `W A S D` pour bouger, `Q` pour arrêter, `ÉCHAP` pour quitter.
+
+## 6. Notebook d'évaluation
+
+Le notebook `run_controller.ipynb` reproduit la même boucle que
+`run_with_controller.py` mais dans un environnement Jupyter — c'est l'équivalent
+de ce qui sera utilisé pour évaluer la soumission.
+
+## 7. Structure du dossier
+
+```
+miniproject/
+├── README.md             ← ce fichier
+├── SUBMISSION.md         ← description détaillée du contrôleur
+├── run_with_controller.py ← exécutable principal (pygame + CLI)
+├── run_interactive.py    ← mode interactif (clavier)
+├── run_controller.ipynb  ← équivalent notebook
+└── submission/
+    ├── controller.py     ← LE contrôleur
+    └── __init__.py
+```
+
+## 8. Dépannage
+
+- **Fenêtre noire (Linux)** : ajouter `--dont-use-pygame-rendering` (nécessite `uv pip install pynput`).
+- **MuJoCo sans display** (serveur headless) : exporter `MUJOCO_GL=egl` et `PYOPENGL_PLATFORM=egl` avant de lancer.
+- **FPS très bas en pygame** : utiliser `--no-display` pour benchmark, sinon réduire la taille fenêtre n'est pas exposé en CLI (modifier la valeur de scale dans `run_with_controller.py`).
