@@ -37,12 +37,18 @@ class Controller:
     # --- scheduling ---
     DECISION_INTERVAL_S = 0.025  # 25 ms = 40 décisions/s
 
-    # --- olfaction (stop only) ---
+    # --- olfaction (navigation + stop) ---
+    # The controller steers only from bilateral odor: left sensors stronger
+    # means the source is on the left, so the fly must turn left.
     PALP_WEIGHT = 9
     ANTENNA_WEIGHT = 1
     EPS_ODOR = 1e-12
-    STOP_ODOR_THRESHOLD = 5e-3      # 10x plus permissif : laisse la mouche
-                                     # s'approcher jusqu'à STOP_DIST physique
+    ODOR_CONTRAST_GAIN = 10.0
+    ODOR_MEMORY_ALPHA = 0.35
+    ODOR_MEMORY_DECAY = 0.98
+    ODOR_MIN_NAV_SIGNAL = 1e-12
+    AVOID_DISABLE_CLOSE_ODOR = 1.5e-3
+    STOP_ODOR_THRESHOLD = 5e-3
     STOP_DIST = 2.0
 
     # --- drives ---
@@ -250,9 +256,10 @@ class Controller:
         self._escape_dir = 1
         self._flip_decisions = 0
         self._tilt_decisions = 0
-        self._banana_xy = None
+        # No true banana/world position is stored in the controller.
         self._request_reset = False
         self._last_target_bearing = 0.0
+        self._odor_heading_memory = 0.0
         self._last_dist_to_banana = None
         self._debug_decisions = 0
 
@@ -284,11 +291,6 @@ class Controller:
         self._collision_cooldown = 0
         # Peak head force tracking entre 2 décisions (échantillonnage @ sim step)
         self._head_force_peak = 0.0
-
-        try:
-            self._banana_xy = np.asarray(sim.world.banana_xy, dtype=float)
-        except Exception:
-            self._banana_xy = None
 
         # Lift fly at spawn + aligne le corps SUR LA PENTE (z_body = normale
         # terrain au point de spawn). Préserve le yaw initial choisi par le sim.
@@ -659,59 +661,54 @@ class Controller:
 
     # ------------------------------------------------------------------
     def _compute_target_bias(
-        self, sim, thorax_xy: np.ndarray
+        self, sim, thorax_xy: np.ndarray | None = None
     ) -> tuple[float, float]:
-        """Steering bias vers la banane (cap banane).
+        """Odor-only steering bias.
 
-        Convention :
-          bearing > 0 → banane à GAUCHE  → target_bias < 0 → drives=[min,max] → tourne à GAUCHE
-          bearing < 0 → banane à DROITE → target_bias > 0 → drives=[max,min] → tourne à DROITE
+        This function estimates the source direction from bilateral olfaction
+        only, not from the hidden world-space banana coordinate.
+
+        Convention kept from the previous controller:
+          bearing > 0 -> odor stronger on LEFT  -> target_bias < 0 -> turn LEFT
+          bearing < 0 -> odor stronger on RIGHT -> target_bias > 0 -> turn RIGHT
         """
-        if self._banana_xy is None:
+        try:
+            odor_lin = sim.get_olfaction(sim.fly.name)
+            lp, rp, la, ra = odor_lin[:, 0]
+        except Exception:
             return 0.0, 0.0
-        to_target = np.asarray(self._banana_xy, dtype=float) - np.asarray(
-            thorax_xy, dtype=float
-        )
-        dist_tt = float(np.linalg.norm(to_target))
-        if dist_tt < 1e-9:
-            return 0.0, 0.0
-        to_target /= dist_tt
-        heading_xy, lateral_xy = self._get_body_frame_xy(sim)
-        lateral_err = float(np.dot(lateral_xy, to_target))
-        forward_err = float(np.dot(heading_xy, to_target))
-        # Banane derrière + sur le côté → demi-tour court
-        if (
-            self._enable_grass
-            and self._enable_terrain
-            and dist_tt > 13.0
-            and forward_err < -0.03
-            and abs(lateral_err) > 0.28
-        ):
-            s = 1.0 if lateral_err >= 0.0 else -1.0
-            bearing = float(s * (np.pi - 0.42))
+
+        odor_l = self.PALP_WEIGHT * float(lp) + self.ANTENNA_WEIGHT * float(la)
+        odor_r = self.PALP_WEIGHT * float(rp) + self.ANTENNA_WEIGHT * float(ra)
+        mean_odor = 0.5 * (odor_l + odor_r)
+
+        contrast = (odor_l - odor_r) / (odor_l + odor_r + float(self.EPS_ODOR))
+        contrast = float(np.clip(contrast, -1.0, 1.0))
+
+        if mean_odor <= float(self.ODOR_MIN_NAV_SIGNAL):
+            self._odor_heading_memory *= float(self.ODOR_MEMORY_DECAY)
         else:
-            fe = float(forward_err)
-            if self._enable_grass and self._enable_terrain and dist_tt < 30.0 and fe > 0.04:
-                fe = max(fe, 0.11)
-            bearing = float(np.arctan2(lateral_err, fe))
+            raw_cue = float(np.tanh(float(self.ODOR_CONTRAST_GAIN) * contrast))
+            a = float(self.ODOR_MEMORY_ALPHA)
+            self._odor_heading_memory = (
+                (1.0 - a) * self._odor_heading_memory + a * raw_cue
+            )
+
+        odor_cue = float(np.clip(self._odor_heading_memory, -1.0, 1.0))
+        bearing = odor_cue * (0.5 * np.pi)
+
         g = (
             self.TARGET_STEER_GAIN_CLOSE
-            if dist_tt < self.TARGET_STEER_CLOSE_DIST
+            if mean_odor > float(self.AVOID_DISABLE_CLOSE_ODOR)
             else self.TARGET_STEER_GAIN
         )
-        bias = -float(self.TARGET_STEER_BIAS_SCALE) * g * bearing
-        return bias, bearing
+        bias = -float(self.TARGET_STEER_BIAS_SCALE) * float(g) * float(bearing)
+        return bias, float(bearing)
 
     # ------------------------------------------------------------------
     def _compute_drives(self, sim) -> np.ndarray:
         if self._stopped:
             return np.array([0.0, 0.0])
-
-        if self._banana_xy is None:
-            try:
-                self._banana_xy = np.asarray(sim.world.banana_xy, dtype=float)
-            except Exception:
-                self._banana_xy = None
 
         try:
             thorax_xy = sim.get_body_positions(sim.fly.name)[self._thorax_idx, :2]
@@ -719,13 +716,9 @@ class Controller:
             thorax_xy = sim.mj_data.xpos[self._thorax_body_id, :2]
         thorax_xy = np.asarray(thorax_xy, dtype=float)
 
+        # The controller intentionally does not know the true banana distance.
+        # This variable is kept only so existing debug formatting can print "?".
         dist_to_banana = None
-        if self._banana_xy is not None:
-            dist_to_banana = float(np.linalg.norm(thorax_xy - self._banana_xy))
-            self._last_dist_to_banana = dist_to_banana
-            if dist_to_banana <= float(self.STOP_DIST):
-                self._stopped = True
-                return np.array([0.0, 0.0])
 
         # ---- stuck detection / escape (terrain trap) ----
         moved = float("inf")
@@ -838,7 +831,11 @@ class Controller:
         odor_r = self.PALP_WEIGHT * float(rp) + self.ANTENNA_WEIGHT * float(ra)
         mean_odor = 0.5 * (odor_l + odor_r)
         if mean_odor > self.STOP_ODOR_THRESHOLD:
-            print(f"[STOP REASON] ODOR d={self._debug_decisions} mean_odor={mean_odor:.3e} dist={dist_to_banana:.2f}", flush=True)
+            print(
+                f"[STOP REASON] ODOR d={self._debug_decisions} "
+                f"mean_odor={mean_odor:.3e}",
+                flush=True,
+            )
             self._stopped = True
             return np.array([0.0, 0.0])
 
@@ -856,7 +853,7 @@ class Controller:
         if (
             self.ALIGN_INITIAL_ENABLE
             and not self._align_done
-            and self._banana_xy is not None
+            and mean_odor > float(self.ODOR_MIN_NAV_SIGNAL)
         ):
             if self._align_dir == 0.0:
                 self._align_dir = 1.0 if bearing > 0.0 else -1.0
@@ -921,10 +918,8 @@ class Controller:
         # ---- REPULSION FIELD / GO ----
         # Tous les piques détectés exercent une force de répulsion. Pas de FSM
         # AVOID. Si pas de piques (ou trop proche banane), GO direct vers banane.
-        close_to_banana = (
-            dist_to_banana is not None
-            and dist_to_banana < float(self.AVOID_DISABLE_CLOSE_DIST)
-        )
+        # Nearness is inferred from odor intensity, not true banana distance.
+        close_to_banana = mean_odor > float(self.AVOID_DISABLE_CLOSE_ODOR)
 
         if close_to_banana:
             bias = float(target_bias)
