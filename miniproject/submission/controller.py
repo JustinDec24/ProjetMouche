@@ -49,9 +49,9 @@ class Controller:
     ANTENNA_WEIGHT = 1
     EPS_ODOR = 1e-12
     STOP_ODOR_THRESHOLD = 5e-3          # stop quand mean_odor > seuil = au but
-    # Stop physique (ground-truth banana_xy) : sécurité finale. La navigation
-    # reste 100% olfactive, banana_xy n'est utilisé QUE pour ce critère d'arrêt.
-    STOP_DIST = 2.0                     # mm
+    # IMPORTANT conformité : on ne lit jamais sim.world.banana_xy pour naviguer
+    # ni pour arrêter. L'arrêt est olfactif uniquement; l'évaluateur détecte
+    # lui-même si le thorax entre dans le cercle cible.
     # Gain "attractif" du notebook (signe négatif = source attractive).
     OLF_ATTRACTIVE_GAIN = -500.0
     # EMA sur le signal olfactif brut (exercice 2 du notebook week4).
@@ -77,6 +77,55 @@ class Controller:
     # Seuils de proximité (en mean_odor) — remplacent dist_to_banana :
     ODOR_CLOSE_THRESHOLD = 1e-5         # mean_odor > X → gain serré (TARGET_STEER_GAIN_CLOSE)
     ODOR_SPRINT_THRESHOLD = 1e-4        # mean_odor > X → sprint final (pas de répulsion)
+
+    # --- Wind-aware plume tracking (Level 3/4) ------------------------------
+    # En vent, l'odeur est advectée : le gradient local ne pointe pas toujours
+    # radialement vers la banane. On ne lit PAS le vecteur de vent; on utilise
+    # seulement l'olfaction dans le temps : surge si l'odeur monte, casting si
+    # elle disparaît/chute après un pic.
+    WIND_ODOR_EMA_ALPHA = 0.55          # plus réactif aux changements de plume
+    WIND_ATTRACTIVE_GAIN = -80.0        # moins saturant que -500 : évite de suivre le bruit
+    WIND_TARGET_BIAS_SCALE = 4.0
+    WIND_MIN_ODOR_FOR_STEER = 1e-10     # sous ce seuil, asymétrie L/R considérée non fiable
+    WIND_CAST_ENABLE = True
+    WIND_CAST_ODOR_LOST = 2e-8          # odeur trop faible → zig-zag de recherche
+    WIND_CAST_PEAK_MIN = 2e-7           # il faut avoir senti un vrai panache avant drop-cast
+    WIND_CAST_DROP_RATIO = 0.35         # mean < peak × ratio → on a quitté le panache
+    WIND_CAST_TREND_DROP = -0.10        # chute log-odor/décision confirmée
+    WIND_CAST_DECISIONS = 28            # ~0.7 s de casting
+    WIND_CAST_COOLDOWN = 10
+    WIND_CAST_MAX_DRIVE = 1.65
+    WIND_CAST_MIN_SIDE = 0.22
+    WIND_BASE_DRIVE_SCALE = 0.72        # marche moins vite en vent → moins de flip/dérive
+    WIND_SURGE_ODOR_MIN = 5e-8
+    WIND_SURGE_TREND_MIN = 0.03         # si log-odor augmente, on avance dans cette direction
+    WIND_SURGE_DRIVE = 1.55
+    WIND_TURN_MOD_SCALE = 0.85
+
+    # --- Wind plume inference (no banana/grass ground truth) ----------------
+    # In level 3 the plume is advected. The instant L/R odor difference is only
+    # a local cue; it can point along the plume edge instead of to the source.
+    # We therefore estimate an UPWIND/source side from the fly's own drift:
+    #   - actual displacement projected onto the body lateral axis estimates
+    #     wind-induced side drift,
+    #   - the source is expected on the opposite/upwind side of the advected
+    #     plume,
+    #   - odor trend decides how strongly we trust this memory.
+    # This uses only self-motion + olfaction, never banana/grass coordinates.
+    WIND_INFER_ENABLE = True
+    WIND_MEMORY_MIN_ODOR = 4e-8
+    WIND_MEMORY_STRONG_ODOR = 4e-6
+    WIND_DRIFT_EMA_ALPHA = 0.18
+    WIND_DRIFT_GAIN = 2.2
+    WIND_MEMORY_EMA_ALPHA = 0.22
+    WIND_SOURCE_BLEND_RISING = 0.25
+    WIND_SOURCE_BLEND_FLAT = 0.45
+    WIND_SOURCE_BLEND_FALLING = 0.72
+    WIND_SOURCE_BIAS_MIN = 0.08
+    WIND_BAD_TREND = -0.045
+    WIND_GOOD_TREND = 0.020
+    WIND_HARD_DROP_RATIO = 0.55
+    WIND_MEMORY_TURN_SCALE = 4.2
 
     # --- "passing by" detector (demi-tour quand l'odeur chute après pic) ---
     # Stratégie de chimiotaxie biologique : si on est passé près de la source
@@ -154,7 +203,7 @@ class Controller:
     #   - startup (stabilisation au spawn sur le terrain),
     #   - phase de recul head-collision (besoin de coller au sol pour reculer).
     TERRAIN_GRIP_FORCE = 12.0   # grip fort partout
-    WIND_GRIP_FORCE = 12.0      # grip fort partout (vent)
+    WIND_GRIP_FORCE = 18.0      # vent L3/L4 : grip plus fort, appliqué seulement aux pattes en appui
     COLLISION_BACKUP_GRIP_FORCE = 12.0  # grip fort LOCAL pendant le recul head-collision (x2)
     STARTUP_GRIP_FORCE = 28.0   # grip fort LOCAL pour stabiliser au spawn (x2)
     # Grip fort sur toutes les pattes pendant les N premiers SIM STEPS (pas
@@ -331,12 +380,7 @@ class Controller:
         # Peak head force tracking entre 2 décisions (échantillonnage @ sim step)
         self._head_force_peak = 0.0
 
-        # Position banane (UNIQUEMENT pour le stop physique à STOP_DIST).
-        # La navigation reste 100 % olfactive.
-        try:
-            self._banana_xy = np.asarray(sim.world.banana_xy, dtype=float)
-        except Exception:
-            self._banana_xy = None
+        # Aucune lecture de sim.world.banana_xy : navigation + arrêt = olfaction.
 
         # État EMA olfactif (tableau (n_sensors × n_odor_dim) lissé).
         self._odor_smooth = None
@@ -345,6 +389,28 @@ class Controller:
         self._uturn_left = 0               # décisions restantes en demi-tour
         self._uturn_dir = 0.0              # ±1 = côté du pivot
         self._uturn_cooldown = 0           # décisions de cooldown
+
+        # Wind/plume state. Direction convention : +1 = pivot droite, -1 = pivot gauche.
+        self._wind_log_odor_prev = None
+        self._wind_log_trend = 0.0
+        self._wind_odor_peak = 0.0
+        self._wind_cast_left = 0
+        self._wind_cast_dir = 1.0
+        self._wind_cast_cooldown = 0
+        self._last_reliable_target_dir = 1.0
+        # Wind/plume inference state. Sign convention is the same as target_bias:
+        # +1 = source/banana likely to the right, -1 = likely to the left.
+        self._wind_prev_xy = None
+        self._wind_drift_source_bias = 0.0
+        self._wind_source_bias_ema = 0.0
+        self._wind_last_good_source_bias = 0.0
+        self._wind_last_forward_disp = 0.0
+        self._wind_last_lateral_disp = 0.0
+
+        # En vent, ne pas faire l'ALIGN initial basé sur une asymétrie minuscule :
+        # le panache advecté peut donner un signe très bruité au spawn.
+        if self._enable_wind:
+            self._align_done = True
 
         # NOTE : sim.world.banana_xy interdit. Navigation = olfaction uniquement.
 
@@ -742,7 +808,7 @@ class Controller:
         if self._odor_smooth is None:
             self._odor_smooth = raw.copy()
         else:
-            a = float(self.ODOR_EMA_ALPHA)
+            a = float(self.WIND_ODOR_EMA_ALPHA if self._enable_wind else self.ODOR_EMA_ALPHA)
             self._odor_smooth = (1.0 - a) * self._odor_smooth + a * raw
         odor_intensities = self._odor_smooth
         # Canal 0 = attractif (banane). reshape (2,2) → [[palp0, palp1], [ant0, ant1]]
@@ -762,30 +828,39 @@ class Controller:
         return mean_odor, effective_norm, float(raw_asym)
 
     def _compute_target_bias(
-        self, sim, _thorax_xy=None
+        self, sim, _thorax_xy=None, olfaction=None
     ) -> tuple[float, float]:
-        """Cap banane via OLFACTION (formule notebook).
+        """Cap banane via OLFACTION uniquement.
 
-        target_bias = effective_norm × SCALE   (saturé, pousse fort vers la source)
-        bearing     = raw_asym × π/2           (smooth, reflète l'erreur d'angle)
+        Sans vent : formule notebook originale, très saturante.
+        Avec vent : formule moins saturante + seuil de fiabilité, car le panache
+        advecté donne parfois une très petite asymétrie L/R qui ne doit pas
+        provoquer un pivot dur.
 
-        Cette séparation évite le bug 360° : effective_norm sature à ±1 dès
-        qu'il y a 1 % d'asymétrie, donc un bearing dérivé directement de
-        effective_norm garderait ALIGN/GO_PIVOT activés en permanence.
-        En utilisant raw_asym (linéaire en l'erreur) pour le bearing, ALIGN
-        et GO_PIVOT se désengagent dès que la mouche est ~face à la source.
-
-        Convention controller (inchangée) :
+        Convention controller :
           target_bias < 0 → tourne à GAUCHE
-          bearing     > 0 → banane à GAUCHE (signe opposé à target_bias)
+          target_bias > 0 → tourne à DROITE
+          bearing a le signe opposé à target_bias pour GO_PIVOT.
         """
-        mean_odor, effective_norm, raw_asym = self._read_olfaction(sim)
+        if olfaction is None:
+            mean_odor, effective_norm, raw_asym = self._read_olfaction(sim)
+        else:
+            mean_odor, effective_norm, raw_asym = olfaction
+
+        if self._enable_wind:
+            # Ne jamais tourner sur une asymétrie essentiellement numérique.
+            if mean_odor < float(self.WIND_MIN_ODOR_FOR_STEER):
+                return 0.0, 0.0
+            # Moins saturant que tanh((-500*raw_asym)^2)*sign(...).
+            # Le signe reste compatible avec effective_norm/target_bias existants.
+            target_norm = float(np.tanh(float(self.WIND_ATTRACTIVE_GAIN) * float(raw_asym)))
+            target_bias = target_norm * float(self.WIND_TARGET_BIAS_SCALE)
+            bearing = -target_norm * (np.pi / 2.0)
+            if abs(target_bias) > 0.25:
+                self._last_reliable_target_dir = 1.0 if target_bias > 0.0 else -1.0
+            return target_bias, bearing
+
         target_bias = float(effective_norm) * float(self.OLF_TARGET_BIAS_SCALE)
-        # Amplifie raw_asym (typiquement ~0.03 au spawn) avant scaling angulaire,
-        # puis clip à ±1 pour borner |bearing| ≤ π/2. Garde la proportionnalité
-        # (bearing→0 quand asym→0) mais avec une dynamique utilisable par ALIGN.
-        # Gain ↑ quand on est proche : raw_asym plus grand et fiable → on veut
-        # déclencher GO_PIVOT dès une petite déviation pour rester sur la cible.
         gain = (
             float(self.OLF_BEARING_GAIN_CLOSE)
             if mean_odor > float(self.ODOR_CLOSE_THRESHOLD)
@@ -793,31 +868,279 @@ class Controller:
         )
         scaled = float(np.clip(raw_asym * gain, -1.0, 1.0))
         bearing = -scaled * (np.pi / 2.0)
+        if abs(target_bias) > 0.25:
+            self._last_reliable_target_dir = 1.0 if target_bias > 0.0 else -1.0
         return target_bias, bearing
+
+    # ------------------------------------------------------------------
+    def _update_wind_plume_state(
+        self,
+        mean_odor: float,
+        target_bias: float,
+        sim=None,
+        thorax_xy=None,
+    ) -> None:
+        """Track odor trend + infer source/upwind side without ground truth.
+
+        Important for Level 3: wind advects the odor. The local L/R odor
+        asymmetry can follow a plume edge and can temporarily point away from
+        the true source. We estimate an additional source-side memory from:
+          1. temporal odor trend (is this direction improving or worsening?),
+          2. self-motion drift in the body frame (wind pushes the fly downwind;
+             the source is inferred upwind),
+          3. last side that produced an increasing odor trend.
+
+        Sign convention of all stored biases:
+          +1 = source likely to the RIGHT  -> target_bias positive
+          -1 = source likely to the LEFT   -> target_bias negative
+        """
+        if not self._enable_wind:
+            return
+
+        odor = max(float(mean_odor), float(self.EPS_ODOR))
+        log_odor = float(np.log(odor))
+        if self._wind_log_odor_prev is None:
+            dlog = 0.0
+        else:
+            dlog = log_odor - float(self._wind_log_odor_prev)
+        self._wind_log_odor_prev = log_odor
+        self._wind_log_trend = 0.85 * float(self._wind_log_trend) + 0.15 * dlog
+        self._wind_odor_peak = max(float(self._wind_odor_peak), float(mean_odor))
+
+        if abs(target_bias) > 0.25:
+            self._last_reliable_target_dir = 1.0 if target_bias > 0.0 else -1.0
+
+        if self._wind_cast_cooldown > 0:
+            self._wind_cast_cooldown -= 1
+
+        if not self.WIND_INFER_ENABLE:
+            return
+
+        # --- 1) Estimate wind/upwind side from the fly's own drift ---------
+        # We use thorax displacement projected into the current body frame.
+        # During mostly forward walking, lateral displacement is a good proxy
+        # for wind pushing the fly sideways. If the fly is pushed to its left,
+        # the source is expected upwind/to the right, hence same sign as target_bias.
+        if sim is not None and thorax_xy is not None:
+            xy = np.asarray(thorax_xy, dtype=float)
+            if self._wind_prev_xy is not None:
+                dxy = xy - np.asarray(self._wind_prev_xy, dtype=float)
+                try:
+                    heading_xy, lateral_xy = self._get_body_frame_xy(sim)
+                    forward_disp = float(np.dot(dxy, heading_xy))
+                    lateral_disp = float(np.dot(dxy, lateral_xy))
+                except Exception:
+                    forward_disp = 0.0
+                    lateral_disp = 0.0
+                self._wind_last_forward_disp = forward_disp
+                self._wind_last_lateral_disp = lateral_disp
+
+                disp_norm = abs(forward_disp) + abs(lateral_disp) + 1e-6
+                lateral_norm = float(np.clip(lateral_disp / disp_norm, -1.0, 1.0))
+
+                # Hard pivots generate unreliable displacement cues. Estimate
+                # reliability from the previous command asymmetry.
+                try:
+                    prev_drives = np.asarray(self._drives, dtype=float)
+                    prev_mean = float(np.mean(np.abs(prev_drives))) + 1e-9
+                    drive_asym = abs(float(prev_drives[0] - prev_drives[1])) / prev_mean
+                    drive_reliability = float(np.clip(1.0 - 0.55 * drive_asym, 0.0, 1.0))
+                except Exception:
+                    drive_reliability = 1.0
+
+                if abs(lateral_disp) > 1e-5 and drive_reliability > 0.05:
+                    drift_source_bias = lateral_norm * drive_reliability
+                    a = float(self.WIND_DRIFT_EMA_ALPHA)
+                    self._wind_drift_source_bias = (
+                        (1.0 - a) * float(self._wind_drift_source_bias)
+                        + a * float(drift_source_bias)
+                    )
+            self._wind_prev_xy = xy.copy()
+
+        # --- 2) Build a remembered source-side estimate --------------------
+        if mean_odor < float(self.WIND_MEMORY_MIN_ODOR):
+            # No useful plume signal: slowly forget, but do not erase instantly.
+            self._wind_source_bias_ema *= 0.97
+            return
+
+        odor_side = float(np.clip(
+            target_bias / max(float(self.WIND_TARGET_BIAS_SCALE), 1e-9),
+            -1.0,
+            1.0,
+        ))
+        drift_side = float(np.clip(
+            float(self.WIND_DRIFT_GAIN) * float(self._wind_drift_source_bias),
+            -1.0,
+            1.0,
+        ))
+        last_good = float(np.clip(self._wind_last_good_source_bias, -1.0, 1.0))
+
+        # Odor confidence rises smoothly with concentration. Near the plume edge
+        # we keep memory weak; near the source/plume core we trust it more.
+        denom = max(float(self.WIND_MEMORY_STRONG_ODOR - self.WIND_MEMORY_MIN_ODOR), 1e-12)
+        odor_conf = float(np.clip((float(mean_odor) - float(self.WIND_MEMORY_MIN_ODOR)) / denom, 0.0, 1.0))
+        odor_conf = 0.25 + 0.75 * odor_conf
+
+        if self._wind_log_trend > float(self.WIND_GOOD_TREND):
+            # We are getting closer to stronger odor. Store this side as useful,
+            # but still include drift/upwind so we do not blindly follow a plume edge.
+            candidate = 0.62 * odor_side + 0.25 * drift_side + 0.13 * last_good
+        elif self._wind_log_trend < float(self.WIND_BAD_TREND):
+            # Odor is getting worse: instantaneous L/R is likely misleading.
+            # Prefer inferred upwind side and the last side that improved odor.
+            candidate = 0.20 * odor_side + 0.55 * drift_side + 0.25 * last_good
+        else:
+            candidate = 0.42 * odor_side + 0.35 * drift_side + 0.23 * last_good
+        candidate = float(np.clip(candidate, -1.0, 1.0))
+
+        # If candidate is tiny but we had a reliable previous side, keep it.
+        if abs(candidate) < float(self.WIND_SOURCE_BIAS_MIN) and abs(last_good) > 0.2:
+            candidate = 0.5 * last_good
+
+        a = float(self.WIND_MEMORY_EMA_ALPHA) * odor_conf
+        self._wind_source_bias_ema = (
+            (1.0 - a) * float(self._wind_source_bias_ema) + a * candidate
+        )
+        self._wind_source_bias_ema = float(np.clip(self._wind_source_bias_ema, -1.0, 1.0))
+
+        # Update the "good" memory only when odor is improving; this tells us
+        # which side was associated with moving toward the source, not away.
+        if self._wind_log_trend > float(self.WIND_GOOD_TREND) and abs(self._wind_source_bias_ema) > 0.12:
+            self._wind_last_good_source_bias = float(self._wind_source_bias_ema)
+
+    def _apply_wind_source_inference(
+        self,
+        mean_odor: float,
+        target_bias: float,
+        bearing: float,
+    ) -> tuple[float, float]:
+        """Blend instant odor steering with inferred upwind/source memory."""
+        if not (self._enable_wind and self.WIND_INFER_ENABLE):
+            return target_bias, bearing
+        if mean_odor < float(self.WIND_MEMORY_MIN_ODOR):
+            return target_bias, bearing
+
+        source_side = float(np.clip(self._wind_source_bias_ema, -1.0, 1.0))
+        if abs(source_side) < float(self.WIND_SOURCE_BIAS_MIN):
+            return target_bias, bearing
+
+        raw_side = float(np.clip(
+            target_bias / max(float(self.WIND_TARGET_BIAS_SCALE), 1e-9),
+            -1.0,
+            1.0,
+        ))
+
+        # If odor is rising, do not over-correct: surge through the plume.
+        # If odor is falling after a peak, strongly bias to the inferred upwind side.
+        hard_drop = (
+            self._wind_odor_peak >= float(self.WIND_CAST_PEAK_MIN)
+            and mean_odor < float(self._wind_odor_peak) * float(self.WIND_HARD_DROP_RATIO)
+        )
+        if self._wind_log_trend > float(self.WIND_GOOD_TREND) and not hard_drop:
+            blend = float(self.WIND_SOURCE_BLEND_RISING)
+        elif self._wind_log_trend < float(self.WIND_BAD_TREND) or hard_drop:
+            blend = float(self.WIND_SOURCE_BLEND_FALLING)
+        else:
+            blend = float(self.WIND_SOURCE_BLEND_FLAT)
+
+        corrected_side = (1.0 - blend) * raw_side + blend * source_side
+        corrected_side = float(np.clip(corrected_side, -1.0, 1.0))
+        corrected_bias = corrected_side * float(self.WIND_MEMORY_TURN_SCALE)
+        corrected_bearing = -corrected_side * (np.pi / 2.0)
+        return corrected_bias, corrected_bearing
+
+    def _wind_cast_drives(self, mean_odor: float, target_bias: float, sub_mode: str) -> "np.ndarray | None":
+        """Surge-and-cast search for advected odor plumes.
+
+        Returns drives only when casting should override normal GO. Vision
+        repulsion has priority: if sub_mode == REPUL, we do nothing here.
+        """
+        if (not self._enable_wind) or (not self.WIND_CAST_ENABLE):
+            return None
+        if sub_mode != "GO":
+            return None
+
+        # If plume was reacquired, stop casting and let normal chemotaxis steer.
+        if (
+            self._wind_cast_left > 0
+            and mean_odor > float(self.WIND_SURGE_ODOR_MIN)
+            and abs(target_bias) > 0.20
+        ):
+            self._wind_cast_left = 0
+            self._wind_cast_cooldown = int(self.WIND_CAST_COOLDOWN)
+            return None
+
+        lost = mean_odor < float(self.WIND_CAST_ODOR_LOST)
+        dropped = (
+            self._wind_odor_peak >= float(self.WIND_CAST_PEAK_MIN)
+            and mean_odor < float(self._wind_odor_peak) * float(self.WIND_CAST_DROP_RATIO)
+            and self._wind_log_trend < float(self.WIND_CAST_TREND_DROP)
+        )
+
+        if self._wind_cast_left <= 0 and self._wind_cast_cooldown <= 0 and (lost or dropped):
+            # Prefer the inferred upwind/source side, not the instantaneous
+            # plume-edge side. This is the main difference vs blind odor following.
+            source_side = float(self._wind_source_bias_ema)
+            if abs(source_side) < float(self.WIND_SOURCE_BIAS_MIN):
+                source_side = float(self._wind_last_good_source_bias)
+            if abs(source_side) < float(self.WIND_SOURCE_BIAS_MIN) and abs(target_bias) > 0.20:
+                source_side = 1.0 if target_bias > 0.0 else -1.0
+
+            if abs(source_side) >= float(self.WIND_SOURCE_BIAS_MIN):
+                self._wind_cast_dir = 1.0 if source_side > 0.0 else -1.0
+            else:
+                # No reliable inference yet: alternate left/right to sweep.
+                self._wind_cast_dir = -float(self._wind_cast_dir)
+            self._wind_cast_left = int(self.WIND_CAST_DECISIONS)
+
+        if self._wind_cast_left <= 0:
+            return None
+
+        self._wind_cast_left -= 1
+        mx = float(self.WIND_CAST_MAX_DRIVE)
+        mn = float(self.WIND_CAST_MIN_SIDE)
+        # +1 = right pivot, -1 = left pivot
+        if self._wind_cast_dir > 0.0:
+            drives = np.array([mx, mn], dtype=float)
+        else:
+            drives = np.array([mn, mx], dtype=float)
+
+        if self._wind_cast_left <= 0:
+            self._wind_cast_cooldown = int(self.WIND_CAST_COOLDOWN)
+            # reset peak after a completed cast, otherwise one old peak can
+            # trigger repeated casts forever.
+            self._wind_odor_peak = max(float(mean_odor), float(self.WIND_SURGE_ODOR_MIN))
+
+        if (
+            self.DEBUG
+            and self._debug_decisions <= self.DEBUG_MAX_DECISIONS
+            and (self._debug_decisions % self.DEBUG_EVERY_DECISIONS == 0)
+        ):
+            print(
+                f"[dbg d={self._debug_decisions:4d}] mode=WIND-CAST "
+                f"odor={mean_odor:.2e} peak={self._wind_odor_peak:.2e} "
+                f"trend={self._wind_log_trend:+.3f} "
+                f"src={self._wind_source_bias_ema:+.2f} drift={self._wind_drift_source_bias:+.2f} "
+                f"dir={int(self._wind_cast_dir):+d} left={self._wind_cast_left} "
+                f"drives=({drives[0]:.3f},{drives[1]:.3f})",
+                flush=True,
+            )
+        return drives
 
     # ------------------------------------------------------------------
     def _compute_drives(self, sim) -> np.ndarray:
         if self._stopped:
             return np.array([0.0, 0.0])
 
-        # Navigation = OLFACTION uniquement. banana_xy n'est utilisé que pour
-        # le critère d'arrêt physique (STOP_DIST) ci-dessous.
+        # Navigation = OLFACTION uniquement. On ne lit pas la position vraie
+        # de la banane; thorax_xy sert seulement à la proprioception/stuck.
         try:
             thorax_xy = sim.get_body_positions(sim.fly.name)[self._thorax_idx, :2]
         except Exception:
             thorax_xy = sim.mj_data.xpos[self._thorax_body_id, :2]
         thorax_xy = np.asarray(thorax_xy, dtype=float)
 
-        # ---- Stop physique : ||thorax - banana_xy|| ≤ STOP_DIST ----
-        if self._banana_xy is not None:
-            dist_to_banana = float(np.linalg.norm(thorax_xy - self._banana_xy))
-            if dist_to_banana <= float(self.STOP_DIST):
-                print(
-                    f"[STOP REASON] DIST d={self._debug_decisions} dist={dist_to_banana:.2f}",
-                    flush=True,
-                )
-                self._stopped = True
-                return np.array([0.0, 0.0])
+        # Aucun stop par distance/banana_xy : critère d'arrêt olfactif uniquement.
 
         # Lecture olfaction unique pour ce tick.
         mean_odor, effective_norm, _raw_asym = self._read_olfaction(sim)
@@ -833,7 +1156,7 @@ class Controller:
         # On track le pic d'odeur, et si l'odeur courante chute brutalement
         # sous une fraction du pic, on déduit qu'on vient de passer à côté
         # de la banane → demi-tour serré pour revenir dessus.
-        if self.UTURN_ENABLE:
+        if self.UTURN_ENABLE and not self._enable_wind:
             # Update peak (suspended pendant le U-turn lui-même)
             if self._uturn_left == 0:
                 self._odor_peak = max(self._odor_peak, mean_odor)
@@ -986,7 +1309,15 @@ class Controller:
                 return drives
 
         # ---- Cap banane (via olfaction asymétrie L/R) ----
-        target_bias, bearing = self._compute_target_bias(sim, thorax_xy)
+        target_bias, bearing = self._compute_target_bias(
+            sim, thorax_xy, olfaction=(mean_odor, effective_norm, _raw_asym)
+        )
+        # In wind, infer the upwind/source side from self-motion drift + odor
+        # trend, then correct the instant L/R olfactory steering.
+        self._update_wind_plume_state(mean_odor, target_bias, sim=sim, thorax_xy=thorax_xy)
+        target_bias, bearing = self._apply_wind_source_inference(
+            mean_odor, target_bias, bearing
+        )
         self._last_target_bearing = bearing
 
         # ---- Vision panorama (Level 2+) ----
@@ -1104,6 +1435,12 @@ class Controller:
             base_drive = rep_base
             sub_mode = rep_mode
 
+        # En vent, si le panache disparaît/chute, on caste. La vision garde
+        # priorité : pas de WIND-CAST quand un spike impose REPUL.
+        wind_cast = self._wind_cast_drives(mean_odor, target_bias, sub_mode)
+        if wind_cast is not None:
+            return wind_cast
+
         # ---- REPUL-PIVOT : pivot hyper-aggressif sur gros pic détecté ----
         # Si on est en REPUL et que le pic max (en pixels) dépasse le seuil PIVOT,
         # on pivote à fond.
@@ -1151,10 +1488,12 @@ class Controller:
         if self.GO_PIVOT_ENABLE and sub_mode == "GO":
             ab = abs(float(bearing))
             if self._go_pivot_active:
-                if ab < float(self.GO_PIVOT_BEARING_OFF):
+                off_thr = float(self.GO_PIVOT_BEARING_OFF) * (1.5 if self._enable_wind else 1.0)
+                if ab < off_thr:
                     self._go_pivot_active = False
             else:
-                if ab > float(self.GO_PIVOT_BEARING_ON):
+                on_thr = float(self.GO_PIVOT_BEARING_ON) * (1.5 if self._enable_wind else 1.0)
+                if ab > on_thr:
                     self._go_pivot_active = True
 
             if self._go_pivot_active:
@@ -1193,6 +1532,18 @@ class Controller:
         # éviter de filer en tangente devant la banane.
         if approach_zone and not close_to_banana:
             base_drive = min(base_drive, float(self.BASE_DRIVE_CLOSE))
+        if self._enable_wind:
+            base_drive *= float(self.WIND_BASE_DRIVE_SCALE)
+            turn_mod *= float(self.WIND_TURN_MOD_SCALE)
+            # If odor is increasing, keep moving through the plume instead of
+            # over-turning on every small left/right fluctuation.
+            if (
+                sub_mode == "GO"
+                and mean_odor > float(self.WIND_SURGE_ODOR_MIN)
+                and self._wind_log_trend > float(self.WIND_SURGE_TREND_MIN)
+            ):
+                base_drive = max(base_drive, float(self.WIND_SURGE_DRIVE))
+
         slope_mag = 0.0
         if self._enable_terrain:
             slope_forward, slope_lateral, slope_mag = self._get_slope_signals(sim)
@@ -1244,12 +1595,20 @@ class Controller:
             and self._debug_decisions <= self.DEBUG_MAX_DECISIONS
             and (self._debug_decisions % self.DEBUG_EVERY_DECISIONS == 0)
         ):
+            wind_extra = ""
+            if self._enable_wind:
+                wind_extra = (
+                    f" wind_src={self._wind_source_bias_ema:+.2f}"
+                    f" wind_drift={self._wind_drift_source_bias:+.2f}"
+                    f" trend={self._wind_log_trend:+.3f}"
+                )
             print(
                 f"[dbg d={self._debug_decisions:4d}] mode={sub_mode:5s} "
                 f"obs_x={obs_x:+.3f} obs_sz={obs_size:.4f} "
                 f"n_spikes={len(self._vis_all_spikes)} odor={mean_odor:.2e} "
                 f"bearing={bearing:+.3f} target_bias={target_bias:+.3f} "
-                f"bias={bias:+.3f} drives=({drives[0]:.3f},{drives[1]:.3f})",
+                f"bias={bias:+.3f}{wind_extra} "
+                f"drives=({drives[0]:.3f},{drives[1]:.3f})",
                 flush=True,
             )
         return drives
