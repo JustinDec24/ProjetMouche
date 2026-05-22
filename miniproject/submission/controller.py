@@ -86,6 +86,20 @@ class Controller:
     TILT_LEAN_GAIN = 0.30
     TILT_LEAN_SIGN = +1.0
 
+    # --- Tilt freeze (Option B v2) : détection précoce de basculement ---
+    # v2 améliorations vs v1 :
+    #   - Détection PLUS PRÉCOCE (0.60 → 0.75) : catch le tilt avant la chute
+    #   - Drive total à 0 (pas 0.10) : legs immobiles = ancrage MAXIMAL
+    #   - Min duration : reste en freeze ≥ 15 décisions même si upright remonte
+    #   - Exit plus strict (0.85 → 0.92) : ne reprend que totalement stabilisée
+    #   - Boost TILT_LEAN_GAIN ×2 pendant freeze : compensation active du roll
+    TILT_FREEZE_ENABLE = True
+    TILT_FREEZE_ENTER_UPRIGHT = 0.75       # déclenche freeze + tôt
+    TILT_FREEZE_EXIT_UPRIGHT = 0.92        # exit plus strict
+    TILT_FREEZE_DRIVE = 0.0                # full stop : legs immobiles
+    TILT_FREEZE_MIN_DECISIONS = 15         # reste freeze min N décisions (~0.4s)
+    TILT_FREEZE_LEAN_BOOST = 2.0           # multiplie TILT_LEAN_GAIN pendant freeze
+
     # --- grip boost (merge 19/05 : grip doux kreslo + startup REPULSION) ---
     # kreslo : grip FAIBLE appliqué uniquement aux pattes en appui — ne fige
     # jamais la démarche (le grip fort toutes-pattes de REPULSION bloquait la
@@ -259,6 +273,9 @@ class Controller:
         self._align_left = 0
         # GO-mode pivot state (hystérésis)
         self._go_pivot_active = False
+        # Tilt freeze state (Option B v2)
+        self._tilt_freeze_active = False
+        self._tilt_freeze_left = 0
         # Head collision recovery state (séquence en phases)
         # 0 = idle, 1 = backup, 2 = pivot toward banana, 3 = arc around
         self._collision_phase = 0
@@ -384,6 +401,43 @@ class Controller:
         if is_decision_step:
             self._drives = self._compute_drives(sim)
             self._debug_decisions = self._step_count // self._decision_every
+
+            # --- Tilt freeze (Option B v2) : détection précoce + freeze ---
+            # Lit uprightness, update l'état avec hystérésis + min duration,
+            # override les drives en freeze.
+            if self.TILT_FREEZE_ENABLE:
+                try:
+                    upr = float(sim.mj_data.xmat[self._thorax_body_id].reshape(3, 3)[2, 2])
+                except Exception:
+                    upr = 1.0
+                if self._tilt_freeze_active:
+                    # Décrémenter le compteur min ; ne sortir que si min écoulé
+                    # ET uprightness > EXIT.
+                    if self._tilt_freeze_left > 0:
+                        self._tilt_freeze_left -= 1
+                    if (
+                        self._tilt_freeze_left <= 0
+                        and upr > float(self.TILT_FREEZE_EXIT_UPRIGHT)
+                    ):
+                        self._tilt_freeze_active = False
+                else:
+                    if upr < float(self.TILT_FREEZE_ENTER_UPRIGHT):
+                        self._tilt_freeze_active = True
+                        self._tilt_freeze_left = int(self.TILT_FREEZE_MIN_DECISIONS)
+                if self._tilt_freeze_active:
+                    fd = float(self.TILT_FREEZE_DRIVE)
+                    self._drives = np.array([fd, fd], dtype=float)
+                    if (
+                        self.DEBUG
+                        and self._debug_decisions <= self.DEBUG_MAX_DECISIONS
+                        and (self._debug_decisions % self.DEBUG_EVERY_DECISIONS == 0)
+                    ):
+                        print(
+                            f"[dbg d={self._debug_decisions:4d}] mode=TILT-FREEZE "
+                            f"upright={upr:.3f} left={self._tilt_freeze_left} "
+                            f"drives=({fd:.3f},{fd:.3f})",
+                            flush=True,
+                        )
         self._step_count += 1
 
         joint_angles, adhesion = self.turning_controller.step(self._drives)
@@ -418,9 +472,12 @@ class Controller:
                         - float(self.TILT_LEAN_ROLL_ON),
                     ),
                 )
+                gain_eff = float(self.TILT_LEAN_GAIN)
+                if self._tilt_freeze_active:
+                    gain_eff *= float(self.TILT_FREEZE_LEAN_BOOST)
                 offset = (
                     float(self.TILT_LEAN_SIGN)
-                    * float(self.TILT_LEAN_GAIN)
+                    * gain_eff
                     * ramp
                 )
                 if roll_lean > 0:
@@ -479,7 +536,12 @@ class Controller:
             #     arrière.
             in_collision_backup = self._collision_phase == 1
             in_startup_grip = self._step_count < int(self.STARTUP_MAX_GRIP_STEPS)
-            if in_startup_grip:
+            in_tilt_freeze = self._tilt_freeze_active
+            if in_tilt_freeze:
+                # Tilt freeze (Option B) : grip MAX sur toutes les pattes,
+                # priorité absolue pour ancrer la mouche en train de tomber.
+                grip_val = max(float(self.WIND_GRIP_FORCE), float(self.TERRAIN_GRIP_FORCE))
+            elif in_startup_grip:
                 grip_val = float(self.STARTUP_GRIP_FORCE)
                 # Fix L3/L4 : pendant le startup avec vent, on prend le max
                 # pour ne pas être en-dessous du grip vent normal (sinon la
@@ -498,7 +560,10 @@ class Controller:
                 stance = contact_mag > self.CONTACT_THRESHOLD
                 adhesion = np.zeros_like(adhesion)
                 n = min(len(adhesion), len(stance))
-                if in_startup_grip:
+                if in_tilt_freeze:
+                    # Toutes les pattes ancrées pour résister à la chute.
+                    adhesion[:n] = grip_val
+                elif in_startup_grip:
                     # Spawn : grip fort sur TOUTES les pattes (REPULSION).
                     adhesion[:n] = grip_val
                 else:
