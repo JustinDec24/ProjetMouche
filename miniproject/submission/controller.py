@@ -56,8 +56,8 @@ class Controller:
     TURN_MOD = 0.8
 
     # --- target steering (cap banane) ---
-    TARGET_STEER_GAIN = 3.3
-    TARGET_STEER_GAIN_CLOSE = 6.6
+    TARGET_STEER_GAIN = 4.0
+    TARGET_STEER_GAIN_CLOSE = 8.0
     TARGET_STEER_CLOSE_DIST = 24.0
     TARGET_STEER_BIAS_SCALE = 0.25
 
@@ -166,7 +166,7 @@ class Controller:
     REPULSION_FALLOFF_ALPHA = 1.2          # exp(-alpha × p²) : étendue plus large
     REPULSION_CENTRAL_EPS = 0.12           # zone "central" un peu plus large
     REPULSION_CENTRAL_BOOST = 200          # gros boost central
-    REPULSION_BANANA_BLEND = 0.40          # pull banane bien +forte pendant l'esquive
+    REPULSION_BANANA_BLEND = 0.50          # pull banane très forte pendant l'esquive
 
     # === Seuils en pixels verts (taille apparente du pic) ===
     # Augmentés pour ne réagir qu'aux pics suffisamment proches/menaçants.
