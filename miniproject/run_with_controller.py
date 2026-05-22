@@ -124,7 +124,14 @@ def main() -> None:
 
     if show_window:
         pygame.init()
-        display_size = (2200, 2200 if show_top_strip else 1100)
+        # Natural aspect: 2:1 sans top strip, 1:1 avec. Scale jusqu'à ~90%
+        # du moniteur pour que la fenêtre ne déborde pas de l'écran.
+        base_w, base_h = 2200, (2200 if show_top_strip else 1100)
+        info = pygame.display.Info()
+        max_w = int(info.current_w * 0.9) if info.current_w > 0 else base_w
+        max_h = int(info.current_h * 0.9) if info.current_h > 0 else base_h
+        scale = min(max_w / base_w, max_h / base_h, 1.0)
+        display_size = (max(1, int(base_w * scale)), max(1, int(base_h * scale)))
         screen = pygame.display.set_mode(display_size)
         cap = WINDOW_NAME + f"  level={args.level} seed={args.seed}"
         if args.debug_vision:
