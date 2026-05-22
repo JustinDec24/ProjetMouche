@@ -55,10 +55,14 @@ class Controller:
     # Gain "attractif" du notebook (signe négatif = source attractive).
     OLF_ATTRACTIVE_GAIN = -500.0
     # EMA sur le signal olfactif brut (exercice 2 du notebook week4).
-    # alpha haut = réagit vite ; bas = très lisse. 0.3 = bon compromis pour
-    # stabiliser l'asymétrie L/R près de la source (sinon elle flippe vite et
-    # la mouche oscille / passe à côté).
+    # alpha haut = réagit vite ; bas = très lisse.
+    # Sans vent : 0.3 — bon compromis pour stabiliser l'asymétrie L/R près de
+    # la source (sinon elle flippe vite et la mouche oscille / passe à côté).
+    # Avec vent : 0.017 (τ ≈ 1.5 s à 40 Hz) — le sim randomise l'angle du
+    # vent toutes les 100 ms ; en moyennant ~10-15 cycles, on récupère le
+    # plume time-averaged qui est isotrope (comme sans vent).
     ODOR_EMA_ALPHA = 0.3
+    ODOR_EMA_ALPHA_WIND = 0.017
     # effective_norm → target_bias : tanh(target_bias) sera ensuite calculé
     # côté downstream, donc 5.0 ⇒ tanh à ±0.99991 (turn quasi totalement
     # asymétrique). Augmenté de 3.0 → 5.0 pour booster le pull banane.
@@ -739,10 +743,15 @@ class Controller:
             return 0.0, 0.0, 0.0
         # EMA sur le brut (cf. exercice 2 du notebook week4) avant calcul des
         # asymétries. Lisse le bruit qui fait flipper raw_asym près de la source.
+        # En présence de vent, alpha plus petit (~0.017 → τ ≈ 1.5 s) pour
+        # moyenner les ~10-15 cycles de rotation du plume et recouvrer un
+        # signal isotrope ; sans vent, alpha standard (~0.3).
         if self._odor_smooth is None:
             self._odor_smooth = raw.copy()
         else:
-            a = float(self.ODOR_EMA_ALPHA)
+            a = float(
+                self.ODOR_EMA_ALPHA_WIND if self._enable_wind else self.ODOR_EMA_ALPHA
+            )
             self._odor_smooth = (1.0 - a) * self._odor_smooth + a * raw
         odor_intensities = self._odor_smooth
         # Canal 0 = attractif (banane). reshape (2,2) → [[palp0, palp1], [ant0, ant1]]
