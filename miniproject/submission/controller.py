@@ -1,14 +1,16 @@
 """
-BIOENG-456 mini-project controller v4: fast path-planning controller.
+BIOENG-456 mini-project controller v5: odor-only banana navigation.
 
 Main idea:
-    1. Extract the banana position and all grass-blade positions from the simulator.
-    2. Build a 2D A* path through free corridors between grass blades.
-    3. Track that path with a fast NeuroMechFly-style descending drive:
-         path/odor navigation -> [left_drive, right_drive] -> TurningController CPG + adhesion.
-    4. Use local grass repulsion and emergency recovery only when really necessary.
+    1. Never read sim.world.banana_xy inside the controller.
+    2. Estimate the direction of the banana from the spatial gradient of odor
+       across the fly's olfactory sensors.
+    3. Estimate a rough source range from the known odor concentration model.
+    4. Use this odor-derived moving goal for path tracking, local grass
+       repulsion, recovery, and final approach.
 
-Tune only the CFG dataclass first.
+The evaluation scripts may still use the real banana position to score success,
+but the controller itself does not use it.
 """
 
 from __future__ import annotations
@@ -88,9 +90,32 @@ class CFG:
     REPULSE_GAIN_HOME: float = 0.55
     HARD_DANGER_RADIUS: float = 1.45
 
-    # Keep synthetic mid grass as a fallback because the level generator always
-    # places one blade at banana/2. If the real blade is extracted, this dedups.
-    ADD_SYNTHETIC_MID_GRASS: bool = True
+    # Do not add the synthetic banana/2 grass point here: doing so would leak
+    # information about the banana position. We only use grass geoms that are
+    # actually present in the scene.
+    ADD_SYNTHETIC_MID_GRASS: bool = False
+
+    # ------------------------------------------------------------------
+    # Odor-only banana navigation.
+    # The banana position is inferred from olfactory sensor readings, never
+    # from sim.world.banana_xy. The range estimate uses the published odor
+    # model constants from miniproject/arena/banana.py.
+    # ------------------------------------------------------------------
+    ODOR_EPS: float = 1e-30
+    ODOR_DIR_ALPHA: float = 0.38
+    ODOR_GOAL_MIN_RANGE: float = 3.0
+    ODOR_GOAL_MAX_RANGE: float = 35.0
+    ODOR_STOP_THRESHOLD: float = 2.0e-5
+    ODOR_FINAL_THRESHOLD: float = 5.0e-6
+    ODOR_NEAR_THRESHOLD: float = 8.0e-7
+    ODOR_MIN_GRAD_NORM: float = 1e-5
+    ODOR_CAST_PERIOD_STEPS: int = 2400
+    ODOR_CAST_BEARING_RAD: float = 0.65
+    ODOR_PALP_WEIGHT: float = 9.0
+    ODOR_ANTENNA_WEIGHT: float = 1.0
+    ODOR_MODEL_DECAY: float = 500.0
+    ODOR_MODEL_DIFFUSIVITY: float = 20000.0
+    ODOR_MODEL_EMISSION_RATE: float = 1.0
 
     # ------------------------------------------------------------------
     # Stuck detection / recovery. Recovery is deliberately rare.
@@ -174,7 +199,16 @@ class Controller:
         )
         self.thorax_body_id = sim._internal_bodyids_by_fly[self.fly_name][self.thorax_idx]
 
-        self.target_xy = np.asarray(sim.world.banana_xy, dtype=float)
+        # IMPORTANT: do not read sim.world.banana_xy here.
+        # The moving goal below is estimated only from odor readings.
+        self.odor_dir_world = np.array([1.0, 0.0], dtype=float)
+        self.odor_goal_xy = np.array([self.cfg.ODOR_GOAL_MAX_RANGE, 0.0], dtype=float)
+        self.odor_range_est = self.cfg.ODOR_GOAL_MAX_RANGE
+        self.mean_odor = 0.0
+        self.odor_grad_norm = 0.0
+        self._odor_dir_initialized = False
+        self._odor_lut_r, self._odor_lut_logc = self._make_odor_range_lut()
+
         self.grass_xy = self._extract_grass_xy(sim)
 
         self.turning_controller = TurningController(
@@ -202,15 +236,22 @@ class Controller:
         self.last_plan_step = -10**9
         self.plan_failed = False
 
-        # Plan from the actual settled spawn position if possible.
+        # Plan from the actual settled spawn position if possible, using the
+        # initial odor-derived goal.
         try:
-            start_xy = self._pose(sim)[0][:2]
+            start_pos, start_heading, _, _ = self._pose(sim)
+            start_xy = start_pos[:2]
+            self._update_odor_navigation(sim, start_xy, start_heading, step_i=0)
         except Exception:
             start_xy = np.zeros(2, dtype=float)
         self._plan_path(start_xy, step_i=0, force=True)
 
         if self.cfg.DEBUG:
-            print(f"[controller] PATH v4 target_xy={np.round(self.target_xy, 3)}")
+            print("[controller] ODOR v5: banana_xy is not used by the controller")
+            print(
+                f"[controller] initial odor_goal={np.round(self.odor_goal_xy, 3)} "
+                f"range_est={self.odor_range_est:.2f} mean_odor={self.mean_odor:.3e}"
+            )
             print(f"[controller] CPG_FREQ={self.cfg.CPG_FREQ}, extracted grass={len(self.grass_xy)}")
             if len(self.grass_xy):
                 print(f"[controller] first grass={np.round(self.grass_xy[:8], 2)}")
@@ -231,6 +272,120 @@ class Controller:
         roll = math.atan2(xmat[2, 1], xmat[2, 2])
         pitch = math.atan2(-xmat[2, 0], math.sqrt(xmat[2, 1] ** 2 + xmat[2, 2] ** 2))
         return pos, heading, roll, pitch
+
+    def _body_axes(self, heading: float) -> tuple[np.ndarray, np.ndarray]:
+        """Return forward and left unit vectors in world XY."""
+        fwd = np.array([math.cos(heading), math.sin(heading)], dtype=float)
+        left = np.array([-math.sin(heading), math.cos(heading)], dtype=float)
+        return fwd, left
+
+    def _odor_sensor_positions(self, sim: MiniprojectSimulation) -> np.ndarray:
+        """World positions of the fly's olfactory sensors, in the same order as get_olfaction."""
+        internal_ids = sim._intern_odor_sensorids_by_fly[self.fly_name]
+        idx = sim.mj_model.sensor_adr[internal_ids][:, None] + np.arange(3)
+        return np.asarray(sim.mj_data.sensordata[idx], dtype=float)
+
+    def _make_odor_range_lut(self) -> tuple[np.ndarray, np.ndarray]:
+        """Precompute concentration-vs-distance for the odor model.
+
+        This uses only the public odor plume parameters, not the banana position.
+        """
+        try:
+            from scipy.special import k0e
+        except Exception:
+            return np.array([self.cfg.ODOR_GOAL_MIN_RANGE, self.cfg.ODOR_GOAL_MAX_RANGE]), np.array([0.0, -40.0])
+
+        r = np.linspace(0.35, 60.0, 2000)
+        diffusivity = self.cfg.ODOR_MODEL_DIFFUSIVITY
+        decay = self.cfg.ODOR_MODEL_DECAY
+        emission_rate = self.cfg.ODOR_MODEL_EMISSION_RATE
+        kappa_r = np.sqrt(decay / diffusivity) * r
+        log_c = (
+            np.log(emission_rate / (2.0 * np.pi * diffusivity))
+            + np.log(k0e(kappa_r))
+            - kappa_r
+        )
+        return r.astype(float), log_c.astype(float)
+
+    def _range_from_mean_odor(self, mean_odor: float) -> float:
+        """Convert odor concentration to a rough source distance estimate."""
+        if not np.isfinite(mean_odor) or mean_odor <= 0.0:
+            return self.cfg.ODOR_GOAL_MAX_RANGE
+        logc = float(np.log(max(mean_odor, self.cfg.ODOR_EPS)))
+        # log concentration monotonically decreases with distance, so reverse for np.interp.
+        r = float(np.interp(logc, self._odor_lut_logc[::-1], self._odor_lut_r[::-1]))
+        return float(np.clip(r, self.cfg.ODOR_GOAL_MIN_RANGE, self.cfg.ODOR_GOAL_MAX_RANGE))
+
+    def _weighted_mean_odor(self, odor: np.ndarray) -> float:
+        """Weighted mean odor matching the old palp/antenna weighting."""
+        vals = np.asarray(odor, dtype=float).reshape(-1)
+        if vals.size < 4:
+            return float(np.mean(vals)) if vals.size else 0.0
+        lp, rp, la, ra = vals[:4]
+        weighted_sum = (
+            self.cfg.ODOR_PALP_WEIGHT * float(lp)
+            + self.cfg.ODOR_PALP_WEIGHT * float(rp)
+            + self.cfg.ODOR_ANTENNA_WEIGHT * float(la)
+            + self.cfg.ODOR_ANTENNA_WEIGHT * float(ra)
+        )
+        return weighted_sum / (2.0 * (self.cfg.ODOR_PALP_WEIGHT + self.cfg.ODOR_ANTENNA_WEIGHT))
+
+    def _update_odor_navigation(self, sim: MiniprojectSimulation, xy: np.ndarray, heading: float, step_i: int) -> None:
+        """Update self.odor_dir_world and self.odor_goal_xy from olfaction only.
+
+        We estimate the local gradient of log odor concentration by fitting a plane
+        through the four olfactory sensor readings. The gradient points toward
+        increasing concentration, i.e. toward the banana odor source.
+        """
+        try:
+            odor = np.asarray(sim.get_olfaction(self.fly_name), dtype=float)[:, 0]
+            sensor_xy = self._odor_sensor_positions(sim)[:, :2]
+        except Exception:
+            odor = np.zeros(4, dtype=float)
+            sensor_xy = np.zeros((4, 2), dtype=float)
+
+        self.mean_odor = self._weighted_mean_odor(odor)
+        self.odor_range_est = self._range_from_mean_odor(self.mean_odor)
+
+        direction = None
+        grad_norm = 0.0
+        if odor.size >= 3 and sensor_xy.shape[0] == odor.size and np.all(np.isfinite(sensor_xy)):
+            y = np.log(np.maximum(odor, self.cfg.ODOR_EPS))
+            A = sensor_xy - np.mean(sensor_xy, axis=0, keepdims=True)
+            b = y - float(np.mean(y))
+            try:
+                grad, *_ = np.linalg.lstsq(A, b, rcond=None)
+                grad = np.asarray(grad, dtype=float)
+                grad_norm = norm(grad)
+                if np.all(np.isfinite(grad)) and grad_norm > self.cfg.ODOR_MIN_GRAD_NORM:
+                    direction = unit(grad)
+            except Exception:
+                direction = None
+
+        self.odor_grad_norm = float(grad_norm)
+        if direction is None or norm(direction) < 1e-9:
+            # If the odor gradient is temporarily ambiguous, keep moving roughly
+            # in the last known odor direction. Add a slow casting oscillation so
+            # the fly can reacquire the gradient if it points almost straight ahead
+            # or if the body is temporarily tilted on hills.
+            fwd, left = self._body_axes(heading)
+            phase = 2.0 * np.pi * ((step_i % self.cfg.ODOR_CAST_PERIOD_STEPS) / self.cfg.ODOR_CAST_PERIOD_STEPS)
+            cast = math.sin(phase) * self.cfg.ODOR_CAST_BEARING_RAD
+            direction = unit(math.cos(cast) * self.odor_dir_world + math.sin(cast) * left + 0.15 * fwd)
+        else:
+            # On the first valid odor gradient, accept it immediately. After that,
+            # smooth the odor direction to avoid zig-zagging from tiny sensor noise.
+            if not self._odor_dir_initialized:
+                direction = unit(direction)
+                self._odor_dir_initialized = True
+            else:
+                direction = unit((1.0 - self.cfg.ODOR_DIR_ALPHA) * self.odor_dir_world + self.cfg.ODOR_DIR_ALPHA * direction)
+
+        if norm(direction) < 1e-9:
+            direction = self._body_axes(heading)[0]
+        self.odor_dir_world = direction
+        goal_range = float(np.clip(self.odor_range_est, self.cfg.ODOR_GOAL_MIN_RANGE, self.cfg.ODOR_GOAL_MAX_RANGE))
+        self.odor_goal_xy = np.asarray(xy, dtype=float) + goal_range * self.odor_dir_world
 
     def _extract_grass_xy(self, sim: MiniprojectSimulation) -> np.ndarray:
         points: list[np.ndarray] = []
@@ -254,8 +409,8 @@ class Controller:
                 if np.all(np.isfinite(p)):
                     points.append(p)
 
-        if self.cfg.ADD_SYNTHETIC_MID_GRASS and np.all(np.isfinite(self.target_xy)):
-            points.append(0.5 * self.target_xy)
+        # Do not infer/add grass at banana/2 because that would require knowing
+        # the banana position.
 
         if not points:
             return np.zeros((0, 2), dtype=float)
@@ -337,7 +492,11 @@ class Controller:
             return
 
         start = np.asarray(start_xy, dtype=float)
-        goal = self.target_xy.astype(float)
+        goal = np.asarray(self.odor_goal_xy, dtype=float)
+        if not np.all(np.isfinite(goal)):
+            self.path = None
+            self.plan_failed = True
+            return
         res = self.cfg.PATH_RESOLUTION
         mn, mx = self._plan_bounds(start, goal)
         nx = int(np.ceil((mx[0] - mn[0]) / res)) + 1
@@ -436,7 +595,7 @@ class Controller:
 
     def _path_goal(self, xy: np.ndarray) -> tuple[np.ndarray, str]:
         if self.path is None or len(self.path) == 0:
-            return self.target_xy, "home"
+            return self.odor_goal_xy, "odor_home"
 
         # Move the path index forward; never move it backward.
         if self.path_i < len(self.path) - 1:
@@ -459,7 +618,7 @@ class Controller:
                 break
 
         if goal_idx >= len(self.path) - 1:
-            return self.target_xy, "home"
+            return self.odor_goal_xy, "odor_home"
         return self.path[goal_idx], "path"
 
     # ------------------------------------------------------------------
@@ -562,18 +721,22 @@ class Controller:
     def step(self, sim: MiniprojectSimulation):
         pos, heading, roll, pitch = self._pose(sim)
         xy = pos[:2]
-        dist = norm(self.target_xy - xy)
         step_i = int(getattr(sim, "_curr_step", 0))
+        self._update_odor_navigation(sim, xy, heading, step_i)
+
+        # Odor-derived distance proxy. This replaces distance to sim.world.banana_xy.
+        dist = float(self.odor_range_est)
         grass_dist = self._nearest_grass_dist(xy)
 
         # Replan occasionally, and immediately if the planned route is bringing us
-        # too close to grass. This lets the fly correct failed local maneuvers.
+        # too close to grass. The planning goal is self.odor_goal_xy, not banana_xy.
         if self.cfg.USE_GLOBAL_PATH_PLANNER and len(self.grass_xy):
             emergency_replan_ok = (
                 grass_dist < self.cfg.PATH_REPLAN_IF_GRASS_CLOSER_THAN
                 and step_i - self.last_plan_step >= self.cfg.PATH_EMERGENCY_REPLAN_COOLDOWN_STEPS
             )
-            if emergency_replan_ok:
+            odor_goal_drift = self.path is not None and norm(self.path[-1] - self.odor_goal_xy) > 4.5
+            if emergency_replan_ok or odor_goal_drift:
                 self._plan_path(xy, step_i=step_i, force=True)
             else:
                 self._plan_path(xy, step_i=step_i, force=False)
@@ -581,10 +744,10 @@ class Controller:
         current_goal, mode = self._path_goal(xy)
         desired_vec = unit(current_goal - xy)
         if norm(desired_vec) < 1e-9:
-            desired_vec = unit(self.target_xy - xy)
-            mode = "home"
+            desired_vec = self.odor_dir_world.copy()
+            mode = "odor_home"
 
-        # Local repulsion is only a correction around the planned direction.
+        # Local repulsion is only a correction around the odor/path direction.
         rep = self._local_repulsion(xy, mode)
         if mode == "path":
             desired_vec = unit(2.2 * desired_vec + rep)
@@ -625,11 +788,17 @@ class Controller:
             hard = True
             mode = "dragon_back"
         else:
-            if dist < self.cfg.FINAL_TARGET_RADIUS:
+            if self.mean_odor > self.cfg.ODOR_STOP_THRESHOLD:
+                # We are essentially on the source: stop instead of overshooting.
+                base = 0.0
+                gain = 0.0
+                min_forward = 0.0
+                mode = "odor_stop"
+            elif self.mean_odor > self.cfg.ODOR_FINAL_THRESHOLD or dist < self.cfg.FINAL_TARGET_RADIUS:
                 base = self.cfg.DRIVE_FINAL
                 gain = self.cfg.TURN_GAIN_FINAL
                 min_forward = 0.20
-            elif dist < self.cfg.NEAR_TARGET_RADIUS:
+            elif self.mean_odor > self.cfg.ODOR_NEAR_THRESHOLD or dist < self.cfg.NEAR_TARGET_RADIUS:
                 base = self.cfg.DRIVE_HILL
                 gain = self.cfg.TURN_GAIN_FINAL
                 min_forward = 0.22
@@ -652,18 +821,23 @@ class Controller:
                 gain = self.cfg.TURN_GAIN_FAST
                 min_forward = self.cfg.MIN_FORWARD_FAST
 
-            if self.is_pivoting:
-                if abs(err) < self.cfg.PIVOT_RELEASE_ERR:
-                    self.is_pivoting = False
-            elif abs(err) > self.cfg.PIVOT_ERR:
-                self.is_pivoting = True
-
-            if self.is_pivoting:
-                drives = self._pivot_drives(err)
+            if mode == "odor_stop":
+                self.is_pivoting = False
+                drives = np.array([0.0, 0.0], dtype=float)
                 hard = True
-                mode = "pivot"
             else:
-                drives = self._walk_drives(err, base, gain, min_forward)
+                if self.is_pivoting:
+                    if abs(err) < self.cfg.PIVOT_RELEASE_ERR:
+                        self.is_pivoting = False
+                elif abs(err) > self.cfg.PIVOT_ERR:
+                    self.is_pivoting = True
+
+                if self.is_pivoting:
+                    drives = self._pivot_drives(err)
+                    hard = True
+                    mode = "pivot"
+                else:
+                    drives = self._walk_drives(err, base, gain, min_forward)
 
         drives = self._smooth(drives, hard=hard)
 
@@ -678,7 +852,8 @@ class Controller:
             ptxt = "none" if self.path is None else f"{self.path_i}/{len(self.path)-1}"
             print(
                 f"[controller] step={step_i:6d} xy=({xy[0]:+.1f},{xy[1]:+.1f}) "
-                f"dist={dist:5.2f} hdg={heading:+.2f} err={err:+.2f} "
+                f"odor_range={dist:5.2f} odor={self.mean_odor:.2e} grad={self.odor_grad_norm:.2e} "
+                f"hdg={heading:+.2f} err={err:+.2f} "
                 f"mode={mode:>15s} grass={grass_dist:4.1f} path={ptxt:>7s} "
                 f"goal={goal_txt:>15s} drives=({drives[0]:+.2f},{drives[1]:+.2f})"
             )
